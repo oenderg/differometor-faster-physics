@@ -2,7 +2,7 @@
 
 Make **Differometor** faster while preserving its physical predictions and gradients.
 
-This repository includes the public simulator source, example data, [challenge PDF](challenge.pdf), [editable brief](challenge.docx), and a complete start-here benchmark. No separate simulator checkout or GPU is required.
+This repository includes the public simulator source, example data, [challenge PDF](challenge.pdf), [editable brief](challenge.docx), a short [start-here example](start_here.py), and a [full benchmark](benchmark.py). No separate simulator checkout or GPU is required.
 
 ## Start here
 
@@ -14,12 +14,18 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
-python start_here.py --cpus 1 --output benchmark-baseline.json
+python start_here.py
 ```
 
-`--cpus 1` pins all execution to one logical CPU before importing JAX and limits numerical-library threads. It requires Linux or WSL. Omit it to use the CPUs available to your process on other systems. The full benchmark was tested in a 32 GB RAM allocation; its measured peak was about 14.4 GiB. Allow roughly 5 minutes for ten repetitions and the numerical checks; this varies by machine.
+[`start_here.py`](start_here.py) walks through one complete simulation and gradient calculation in five steps. It prints setup time, compilation time, and combined simulation/sensitivity/gradient runtime. It runs once using the CPUs available to the process.
 
-On success, the terminal prints `PASS` and the script writes **`benchmark-baseline.json`** and **`benchmark-baseline.png`**, a simple five-bar timing plot. Use `--repeats 3` for a quicker development run; the default is ten repetitions. Add `--save-arrays baseline.npz` to save results for numerical comparison.
+For reproducible measurements, numerical checks and the five-bar plot, use the full benchmark:
+
+```bash
+python benchmark.py --cpus 1 --output benchmark-baseline.json
+```
+
+`--cpus 1` pins the process to one logical CPU on Linux/WSL. The full benchmark takes roughly 5 minutes for ten repetitions and validation, prints `PASS`, and writes `benchmark-baseline.json` and `benchmark-baseline.png`. Use `--repeats 3` for a shorter run or `--save-arrays baseline.npz` to save outputs. The measured peak memory was about 14.4 GiB.
 
 ## If setup fails
 
@@ -32,18 +38,18 @@ On success, the terminal prints `PASS` and the script writes **`benchmark-baseli
 
 One full saved 3×3 UIFO (quasi-universal interferometer), all **101 frequencies from 800–3000 Hz**, and gradients for **193 physical design variables**. Every evaluation computes carrier fields, signal, quantum noise, detector sensitivity, powers and the gradient of mean log sensitivity relative to the public reference.
 
-The complete first-run total includes input preparation, all compilation, the forward simulation, sensitivity and gradients. Imports, CPU initialization and result transfer are included. Validation and benchmark logging/report/plot generation are excluded. There is no optimization loop.
+In `benchmark.py`, the complete first-run total includes input preparation, all compilation, the forward simulation, sensitivity and gradients. Imports, CPU initialization and result transfer are included. Validation and benchmark logging/report/plot generation are excluded. There is no optimization loop.
 
-The five bars group the detailed measurements without dropping work. Setup includes imports, initialization and loading/building inputs. Compilation combines lowering and compilation for all stages. Sensitivity includes readout and host transfer. The raw JSON retains every stage and all warm repetitions.
+The benchmark’s five bars group the detailed measurements without dropping work. Setup includes imports, initialization and loading/building inputs. Compilation combines lowering and compilation for all stages. Sensitivity includes readout and host transfer. The raw JSON retains every stage and all warm repetitions.
 
 ## Improve and compare
 
 1. Run the unmodified baseline in a fresh Python process.
 2. Use the phase plot to find a bottleneck, then edit `differometor/`.
-3. Run `python start_here.py --cpus 1 --output benchmark-candidate.json`.
+3. Run `python benchmark.py --cpus 1 --output benchmark-candidate.json`.
 4. Compare complete time, including compilation, on matching hardware, CPU affinity and software. Report median warm runtime separately and repeat measurements to assess variability.
 
-Keep the setup, every frequency, double precision, physical outputs and gradients. The starter checks the public sensitivity reference and a numerical gradient at two perturbation sizes. These checks cover one setup; compare full saved arrays and additional public inputs when changing the numerical calculation. Precomputed answers and omitted calculations do not count.
+Keep the setup, every frequency, double precision, physical outputs and gradients. The full benchmark checks the public sensitivity reference and a numerical gradient at two perturbation sizes. These checks cover one setup; compare full saved arrays and additional public inputs when changing the numerical calculation. Precomputed answers and omitted calculations do not count.
 
 Submit your code, before/after JSON reports and plots, reproduction commands, and a short explanation of the improvement and correctness checks.
 
@@ -60,7 +66,7 @@ Tested on **16 November 2026** on an **Intel Xeon Platinum 8468**, pinned to **o
 | Median warm evaluation, ten repetitions | **17.679** |
 | Warm minimum / maximum | 17.118 / 18.282 |
 
-All 101 frequencies and 193 gradients were evaluated. The public sensitivity test and two-step numerical gradient check passed. This was measured on a shared worker, so record your own baseline. The current starter adds archive support and output-path checks to the measured version; the numerical workload is unchanged.
+All 101 frequencies and 193 gradients were evaluated. The public sensitivity test and two-step numerical gradient check passed. This was measured on a shared worker, so record your own baseline. The full benchmark adds archive support and output-path checks to the measured version; its numerical workload is unchanged. The short starter compiles simulation and differentiation together, so its timings are not directly comparable to this staged benchmark.
 
 Replot any saved report without running the simulation:
 

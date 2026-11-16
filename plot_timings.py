@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot five phases from a start_here.py JSON report (no simulation needed)."""
+"""Plot five phases from a benchmark.py JSON report (no simulation needed)."""
 
 import argparse
 import json
@@ -115,7 +115,7 @@ def render(report, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("report", type=Path, help="JSON report from start_here.py")
+    parser.add_argument("report", type=Path, help="JSON report from benchmark.py")
     parser.add_argument("--output", type=Path, required=True, help="Output PNG, SVG or PDF")
     args = parser.parse_args()
     output = render(json.loads(args.report.read_text()), args.output)
