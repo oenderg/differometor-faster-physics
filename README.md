@@ -6,7 +6,14 @@ This repository includes the public simulator source, example data, [challenge P
 
 ## Start here
 
-Use **Python 3.12 on Linux or WSL2**, with **32 GB RAM recommended**. Unpack the supplied repository or clone it, then open a terminal in its root folder (the one containing this README). Git is optional for an extracted archive. Run:
+Use **Python 3.12 on Linux or WSL2**, with **32 GB RAM recommended**. Clone the repository:
+
+```bash
+git clone https://github.com/feyerlabs/start-hack-munich-2026.git
+cd start-hack-munich-2026
+```
+
+Alternatively, [download the ZIP](https://github.com/feyerlabs/start-hack-munich-2026/archive/refs/heads/main.zip), unpack it and open a terminal in its root folder. Then install and run:
 
 ```bash
 python3.12 -m venv .venv
@@ -73,7 +80,7 @@ The supplied checks require:
 
 - **Correct sensitivities:** positive sensitivity at every frequency, matching the public reference with `abs(log(sensitivity) - log(reference)) <= 1e-5` (natural logarithm; about 0.001% relative difference).
 - **Finite results:** carrier, signal, noise, sensitivity, powers, loss and all 193 gradient values contain no NaN or infinity; the gradient is not identically zero.
-- **Consistent gradients:** the `mb11.tuning` derivative agrees with central finite differences at steps `1e-3` and `5e-4`, and the two estimates agree (`rtol=0.01`, `atol=1e-6`). This is a spot check of one parameter, not an exhaustive gradient test.
+- **Consistent gradients:** gradients should pass the supplied sanity check.
 
 Run a shorter check with:
 
