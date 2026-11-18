@@ -36,7 +36,7 @@ python benchmark.py --cpus 1 --output benchmark-baseline.json
 
 ## The workload
 
-One full saved 3×3 UIFO (quasi-universal interferometer), all **101 frequencies from 800–3000 Hz**, and gradients for **193 physical design variables**. Every evaluation computes carrier fields, signal, quantum noise, detector sensitivity, powers and the gradient of mean log sensitivity relative to the public reference.
+One complete saved 3×3 optical setup, all **101 frequencies from 800–3000 Hz**, and gradients for **193 physical design variables**. Every evaluation computes carrier fields, signal, quantum noise, detector sensitivity, powers and the gradient of mean log sensitivity relative to the public reference.
 
 In `benchmark.py`, the complete first-run total includes input preparation, all compilation, the forward simulation, sensitivity and gradients. Imports, CPU initialization and result transfer are included. Validation and benchmark logging/report/plot generation are excluded. There is no optimization loop.
 

@@ -83,7 +83,7 @@ def render(report, output):
         fig.text(0.95, 0.92, seconds_label(total), ha="right", fontsize=21, weight="bold")
         fig.text(0.95, 0.875, "TOTAL", ha="right", fontsize=9, color=MUTED)
         fig.text(0.06, 0.855, details, fontsize=10, color=MUTED)
-        fig.text(0.06, 0.80, "Complete UIFO simulation + gradient · first run", fontsize=11)
+        fig.text(0.06, 0.80, "Complete optical setup simulation + gradient · first run", fontsize=11)
 
         ax = fig.add_axes([0.26, 0.24, 0.69, 0.49])
         ax.barh(range(len(values)), values, height=0.54, color=RED, zorder=3)

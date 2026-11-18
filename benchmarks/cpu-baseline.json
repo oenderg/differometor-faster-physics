@@ -895,7 +895,7 @@
     },
     {
       "key": "build",
-      "label": "Build UIFO and prepare inputs",
+      "label": "Build optical setup and prepare inputs",
       "category": "setup",
       "seconds": 1.0294568971730769
     },

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time a complete public UIFO evaluation and gradient, then plot every phase."""
+"""Time a complete public optical setup evaluation and gradient, then plot every phase."""
 from time import perf_counter
 
 IMPORT_START = perf_counter()
@@ -205,7 +205,7 @@ def main():
         arrays["optimized_parameters"] = parameters
         return arrays, jnp.asarray(ports), parameters, frequencies, expected, pairs, jnp.asarray(1.0, dtype=jnp.float64)
 
-    arrays, ports, parameters, frequencies, expected, pairs, one = timed("build", "Build UIFO and prepare inputs", "setup", build_inputs)
+    arrays, ports, parameters, frequencies, expected, pairs, one = timed("build", "Build optical setup and prepare inputs", "setup", build_inputs)
     print(f"Workload: 101 frequencies; {len(parameters)} physical design variables; no optimizer", flush=True)
 
     forward = compile_phase("forward", "Forward", forward_with_pullback, parameters, arrays)

@@ -1,4 +1,4 @@
-"""One complete UIFO simulation and gradient. Run: python start_here.py"""
+"""One complete optical setup simulation and gradient. Run: python start_here.py"""
 
 import json
 import os
@@ -48,7 +48,7 @@ def evaluate(parameters, arrays, detector_ports, reference_sensitivity):
     carrier, signal, noise = df.simulate(
         **dict(arrays, optimized_parameters=parameters)
     )
-    # This saved UIFO has one signal detector.
+    # This saved optical setup has one signal detector.
     detector_signal = df.signal_detector(carrier, signal)[detector_ports].squeeze()
     sensitivity = noise / jnp.abs(detector_signal)
     powers = df.power_detector(carrier)
