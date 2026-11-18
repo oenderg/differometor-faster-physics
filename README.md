@@ -53,6 +53,16 @@ Keep the setup, every frequency, double precision, physical outputs and gradient
 
 Submit your code, before/after JSON reports and plots, reproduction commands, and a short explanation of the improvement and correctness checks.
 
+## Judging and prizes
+
+- **First prize:** Lowest complete evaluation time among correct submissions whose teams can explain their work.
+- **Second prize:** Second-lowest complete evaluation time under the same requirements.
+- **Special prize:** The most surprising solution, chosen by the Feyer team.
+
+The speed prizes use the **complete first-run benchmark total** on matching hardware and CPU limits. Include imports, initialization, input preparation, all compilation, forward simulation, sensitivity, gradients and result transfer. Validation and benchmark reporting remain outside the timer; warm runtime is reported separately.
+
+Teams must explain, at a high level, what they changed, why it is faster and how correctness was preserved. AI assistance does not replace this understanding: a result the team cannot explain is not eligible for either speed prize.
+
 ## CPU baseline
 
 Tested on **16 November 2026** on an **Intel Xeon Platinum 8468**, pinned to **one logical CPU** with **32 GB RAM** allocated. CPU affinity and numerical-library thread limits are recorded in the [raw report](benchmarks/cpu-baseline.json). No GPU was used.
