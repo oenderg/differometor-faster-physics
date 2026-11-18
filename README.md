@@ -49,19 +49,37 @@ The benchmark’s five bars group the detailed measurements without dropping wor
 3. Run `python benchmark.py --cpus 1 --output benchmark-candidate.json`.
 4. Compare complete time, including compilation, on matching hardware, CPU affinity and software. Report median warm runtime separately and repeat measurements to assess variability.
 
-Keep the setup, every frequency, double precision, physical outputs and gradients. The full benchmark checks the public sensitivity reference and a numerical gradient at two perturbation sizes. These checks cover one setup; compare full saved arrays and additional public inputs when changing the numerical calculation. Precomputed answers and omitted calculations do not count.
+Keep the setup, every frequency, double precision, physical outputs and gradients. The full benchmark runs the quick correctness checks described below. Precomputed answers and omitted calculations do not count.
 
-Submit your code, before/after JSON reports and plots, reproduction commands, and a short explanation of the improvement and correctness checks.
+Submit your code, before/after JSON reports and plots, and reproduction commands. A short note on your approach and correctness checks is welcome.
 
 ## Judging and prizes
 
-- **First prize:** Lowest complete evaluation time among correct submissions whose teams can explain their work.
-- **Second prize:** Second-lowest complete evaluation time under the same requirements.
+- **First prize:** Lowest complete evaluation time among correct submissions.
+- **Second prize:** Second-lowest complete evaluation time among correct submissions.
 - **Special prize:** The most surprising solution, chosen by the Feyer team.
 
 The speed prizes use the **complete first-run benchmark total** on matching hardware and CPU limits. Include imports, initialization, input preparation, all compilation, forward simulation, sensitivity, gradients and result transfer. Validation and benchmark reporting remain outside the timer; warm runtime is reported separately.
 
-Teams must explain, at a high level, what they changed, why it is faster and how correctness was preserved. AI assistance does not replace this understanding: a result the team cannot explain is not eligible for either speed prize.
+AI coding tools are welcome. A high-level explanation of your approach, why it helps and what you learned is encouraged and helps the Feyer team understand your work.
+
+## Correctness: quick checks
+
+A correct submission evaluates the complete setup with all **101 frequencies**, all **193 design variables** and double precision. It preserves the physical results and gradients.
+
+The supplied checks require:
+
+- **Correct sensitivities:** positive sensitivity at every frequency, matching the public reference with `abs(log(sensitivity) - log(reference)) <= 1e-5` (natural logarithm; about 0.001% relative difference).
+- **Finite results:** carrier, signal, noise, sensitivity, powers, loss and all 193 gradient values contain no NaN or infinity; the gradient is not identically zero.
+- **Consistent gradients:** the `mb11.tuning` derivative agrees with central finite differences at steps `1e-3` and `5e-4`, and the two estimates agree (`rtol=0.01`, `atol=1e-6`). This is a spot check of one parameter, not an exhaustive gradient test.
+
+Run a shorter check with:
+
+```bash
+python benchmark.py --cpus 1 --repeats 3 --output benchmark-check.json
+```
+
+A successful run prints `PASS`. These quick checks cover the supplied workload and run outside the scored time. For larger numerical changes, comparing saved arrays or trying another public setup is helpful.
 
 ## CPU baseline
 
