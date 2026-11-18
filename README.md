@@ -2,7 +2,7 @@
 
 Make **Differometor** faster while preserving its physical predictions and gradients.
 
-This repository includes the public simulator source, example data, [challenge PDF](challenge.pdf), [editable brief](challenge.docx), a short [start-here example](start_here.py), and a [full benchmark](benchmark.py). No separate simulator checkout or GPU is required.
+This repository includes the public simulator source, example data, [challenge PDF](challenge.pdf), [judging criteria PDF](judging-criteria.pdf), [editable brief](challenge.docx), a short [start-here example](start_here.py), and a [full benchmark](benchmark.py). No separate simulator checkout or GPU is required.
 
 ## Start here
 
@@ -54,6 +54,8 @@ Keep the setup, every frequency, double precision, physical outputs and gradient
 Submit your code, before/after JSON reports and plots, and reproduction commands. A short note on your approach and correctness checks is welcome.
 
 ## Judging and prizes
+
+Download the standalone [Judging Criteria PDF](judging-criteria.pdf), including timing rules and correctness checks.
 
 - **First prize:** Lowest complete evaluation time among correct submissions.
 - **Second prize:** Second-lowest complete evaluation time among correct submissions.
