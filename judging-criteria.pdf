@@ -2,7 +2,7 @@
 %“Œ‹ ReportLab Generated PDF document (opensource)
 1 0 obj
 <<
-/F1 2 0 R /F2+0 10 0 R /F3+0 14 0 R /F4 5 0 R
+/F1 2 0 R /F2+0 11 0 R /F3+0 15 0 R /F4 5 0 R
 >>
 endobj
 2 0 obj
@@ -33,17 +33,24 @@ endobj
 endobj
 6 0 obj
 <<
-/Contents 18 0 R /MediaBox [ 0 0 595.2756 841.8898 ] /Parent 17 0 R /Resources <<
-/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] /XObject <<
-/FormXob.4c9acf1f6a97bc125f22b6ba13b23616 3 0 R
->>
->> /Rotate 0 /Trans <<
-
->> 
-  /Type /Page
+/A <<
+/S /URI /Type /Action /URI (https://github.com/feyerlabs/start-hack-munich-2026)
+>> /Border [ 0 0 0 ] /Rect [ 54 169.6398 284.0146 183.6398 ] /Subtype /Link /Type /Annot
 >>
 endobj
 7 0 obj
+<<
+/Annots [ 6 0 R ] /Contents 19 0 R /MediaBox [ 0 0 595.2756 841.8898 ] /Parent 18 0 R /Resources <<
+/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] /XObject <<
+/FormXob.4c9acf1f6a97bc125f22b6ba13b23616 3 0 R
+>>
+>> /Rotate 0 
+  /Trans <<
+
+>> /Type /Page
+>>
+endobj
+8 0 obj
 <<
 /Filter [ /FlateDecode ] /Length 683
 >>
@@ -58,7 +65,7 @@ xœ}ÕMkQÆñ½Ÿb–-¥èó–‚yi ‹¾Ğ”î^SK2Êhùö=OH/¥TĞóg.şÀÅ™^Ş\İÛc7ı:îV·õØm¶Ãz¬‡İÓ
 ¿Ò¯ğ+ı
 ¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ıĞğıĞğıĞğıĞğıĞğıĞğıĞğıĞğı/âe`W`í½.¢ÕÓ8æ:íÆÓâÁÊÙõu}îw{œÂû7GÄ£¯endstream
 endobj
-8 0 obj
+9 0 obj
 <<
 /Filter [ /FlateDecode ] /Length 18209 /Length1 35180
 >>
@@ -145,16 +152,16 @@ PjàX}fÜJè§Âx/Ì^Â)ôÖ.¨«œ]Ñ ö*MPSa®ÎZ ¨l¨o¨ó”T'ª¹5¥IjFU•ZH{Õ«…zOİ<OY’òƒ¡é
 ))v%«I1¶Å2S!342]#ÓàzšF®.\«‘©p55œLÑÈäV2I#áÚ}i¢F&h¤(ŠŒ"…×8…ÂVr<¸ÆI
 Æ9…‚V2.ß.Œs’|;EòÆ	y2f´]DFçZ„Ñv’k!£ZINvã ÙA$«•d´™V2ÒBFd¸„­$`f¸ˆ{¸UpkdøÕa¸•\m!Ã†š…aÁd¨™)#ƒ5’D®ÒÈ @20-Lè"i‚„´0’v˜ ˜…AdÀR¾ªIèDú»ùTé—²Uè§‘€Ÿ²•$›HR é›8XèÛJ.!q0éSFz—‘ôrø»EzªÄEzÄúôˆ"qv‹ÌBl+‰±’7¯‘h…DE‘È§é"Ö@!ÂI"öÏ¸—7“0ç!l1qÂ¤Î1$T#!v³·Üs¸HP	´“ ØáÚ®[±Zl‚5Xó±,åÍğÄÜJL©Ä¤ƒ‰q)¯˜‰âæeH1hDAÔˆ ÁÍó­„”Fqx/³€í™	Ş‡Ën^ûüÿÇúo#ğoü‰Dÿ/µßbendstream
 endobj
-9 0 obj
+10 0 obj
 <<
-/Ascent 759.7656 /CapHeight 759.7656 /Descent -240.2344 /Flags 262148 /FontBBox [ -1069.336 -415.0391 1975.098 1175.293 ] /FontFile2 8 0 R 
+/Ascent 759.7656 /CapHeight 759.7656 /Descent -240.2344 /Flags 262148 /FontBBox [ -1069.336 -415.0391 1975.098 1175.293 ] /FontFile2 9 0 R 
   /FontName /AAAAAA+DejaVuSans-Bold /ItalicAngle 0 /MissingWidth 600.0977 /StemV 165 /Type /FontDescriptor
 >>
 endobj
-10 0 obj
+11 0 obj
 <<
-/BaseFont /AAAAAA+DejaVuSans-Bold /FirstChar 0 /FontDescriptor 9 0 R /LastChar 127 /Name /F2+0 /Subtype /TrueType 
-  /ToUnicode 7 0 R /Type /Font /Widths [ 600.0977 500 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
+/BaseFont /AAAAAA+DejaVuSans-Bold /FirstChar 0 /FontDescriptor 10 0 R /LastChar 127 /Name /F2+0 /Subtype /TrueType 
+  /ToUnicode 8 0 R /Type /Font /Widths [ 600.0977 500 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
   600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
   600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
   600.0977 600.0977 348.1445 456.0547 520.9961 837.8906 695.8008 1001.953 872.0703 306.1523 
@@ -169,7 +176,7 @@ endobj
   645.0195 651.8555 582.0312 711.9141 365.2344 711.9141 837.8906 600.0977 ]
 >>
 endobj
-11 0 obj
+12 0 obj
 <<
 /Filter [ /FlateDecode ] /Length 684
 >>
@@ -184,7 +191,7 @@ xœmÕK‹ÚPÆñ}>E–-]èÉ{kA„¹t`½Ğ)İ;zœZjQóí{<2shĞ÷’à³xg7÷·÷ıîÔÎ¾‡õC>µÛ]¿óñp
 ¿Ò¯ğ+ı
 ¿Ò¯ğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğı¿Ñoğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿Óïğ;ı¿ÓïğıĞğıĞğıĞğıĞğıĞğıĞğıĞğıĞÙ—M€]=÷²ƒÖçq,ëiZ†ÓâÁÊÙõùe_‡OáóåâÅendstream
 endobj
-12 0 obj
+13 0 obj
 <<
 /Filter [ /FlateDecode ] /Length 18728 /Length1 35632
 >>
@@ -271,16 +278,16 @@ k”²Âj€XRÑ…'Të:´»X©­(ö ÜªÌÓ(ü!©V»§S«fb£B*T¦Sï¶âíXYXtoáT ì°Â-SUıç”ªËTà° Å’é¥©
 ŒRÉÈL«0Ò‡d†˜„L+a"ÃU’ÑHÒÉ0•åz
 C¯‘´—Hê(âRÉ•¾İ.vÛY„ÛídĞ@“0ÈuÃBšÈ •ôWI¿¾¡ß5Ò·Uèë }z„>VÒÛ@z…’I¾Í $«ä6IJ4I&’h 	=õB‚•ôÔ“ødÒ£{´Ğ£˜t³İ£Iœt‹º¥’Øhmb,$Ú@¢T©’	:ÃíD)&a×H(ZLBL$8¬’ k$0ÀE€Jü‹‰pÊO%¾0È7€8UâP‰JìĞÁ®ĞjK#ÖùÄRLÌ*1}“JŒĞÛèK*‘­D¯	ºI*Ñ9ˆXLxxÈƒ8	Ü%*áàšëI°• •àf\¼ô!Üãÿ…ôŸFàBş?Œ¨endstream
 endobj
-13 0 obj
+14 0 obj
 <<
-/Ascent 759.7656 /CapHeight 759.7656 /Descent -240.2344 /Flags 4 /FontBBox [ -1020.508 -462.8906 1793.457 1232.422 ] /FontFile2 12 0 R 
+/Ascent 759.7656 /CapHeight 759.7656 /Descent -240.2344 /Flags 4 /FontBBox [ -1020.508 -462.8906 1793.457 1232.422 ] /FontFile2 13 0 R 
   /FontName /AAAAAA+DejaVuSans /ItalicAngle 0 /MissingWidth 600.0977 /StemV 87 /Type /FontDescriptor
 >>
 endobj
-14 0 obj
+15 0 obj
 <<
-/BaseFont /AAAAAA+DejaVuSans /FirstChar 0 /FontDescriptor 13 0 R /LastChar 127 /Name /F3+0 /Subtype /TrueType 
-  /ToUnicode 11 0 R /Type /Font /Widths [ 600.0977 317.8711 1000 589.8438 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
+/BaseFont /AAAAAA+DejaVuSans /FirstChar 0 /FontDescriptor 14 0 R /LastChar 127 /Name /F3+0 /Subtype /TrueType 
+  /ToUnicode 12 0 R /Type /Font /Widths [ 600.0977 317.8711 1000 589.8438 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
   600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
   600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 600.0977 
   600.0977 600.0977 317.8711 400.8789 459.9609 837.8906 636.2305 950.1953 779.7852 274.9023 
@@ -295,31 +302,31 @@ endobj
   591.7969 591.7969 524.9023 636.2305 336.9141 636.2305 837.8906 600.0977 ]
 >>
 endobj
-15 0 obj
+16 0 obj
 <<
-/PageMode /UseNone /Pages 17 0 R /Type /Catalog
+/PageMode /UseNone /Pages 18 0 R /Type /Catalog
 >>
 endobj
-16 0 obj
+17 0 obj
 <<
 /Author (Feyer) /CreationDate (D:20000101000000+00'00') /Creator (\(unspecified\)) /Keywords () /ModDate (D:20000101000000+00'00') /Producer (ReportLab PDF Library - \(opensource\)) 
   /Subject (Faster Physics \204 Feyer challenge) /Title (Judging Criteria \204 Feyer START Hack Munich Challenge) /Trapped /False
 >>
 endobj
-17 0 obj
-<<
-/Count 1 /Kids [ 6 0 R ] /Type /Pages
->>
-endobj
 18 0 obj
 <<
-/Filter [ /ASCII85Decode /FlateDecode ] /Length 1761
+/Count 1 /Kids [ 7 0 R ] /Type /Pages
+>>
+endobj
+19 0 obj
+<<
+/Filter [ /ASCII85Decode /FlateDecode ] /Length 1852
 >>
 stream
-Gau0C?$"Ia'Rf_Z\1aC-XY'/sRC3VL,sWn9&4?>VQaO3/Q:P2a/(kZP^1XjY@gDLV$je`B>4(1-F3d!nm?*<VhXH"q&Nu]6j"l`YTB8f;678T)?hA.uqD<5U0QLeT3F;&!Bo(*b%;%f'eHgrCCHGrsWTuTZMOj>G[esK;8r^*D',t09MttK,3P@C4I7:?s^Nk,$K'4qOmp3N-kPOo6mgm`N5CN6cI+OE$dJP66J$oA'M)1VIDE<"L;M5h*1WN9(O-1cm0!f<bpe7^Q?b(-mCrWcW[uAuk=_+*G/U`*\0:3P,r#k]BqEp;"NgqqGUD.FuqL&$b<1@]UPU_R-"HK5/4I("CEl&C"B&nV"rXsUUILlZi@c9fmL#=irB>!Db9[7b"FGoVN7B].WpJTj('nnj@Nfn<"o_&d/"^3i4.IlF=3iJeiQp9(Rnn4Y/lC#Y@E[u="ig]f'/Ni!NEV*n1Y=-'u;^E!`?jD.!HZnl<)7@+KddnI%`Q7%^!1!Z4-];P:Yd3?_MB<3S:;Zs[mR1b&:ileokF3h%A8sh8i\T1VI7EXKK7Nq?>Y[HR4O84Zm!2(g!M'On>A?hC:T0KsNi,QO:!$U7I*Kfo[6iHoMM`(J,RTl0V0LRSmM;)7)K3$iNIU9^X*FgYR)]BVA=[WPdDOH*Jb/CQ17s;6JsG)Dg4E6L[0]`>8Xfq4ZKt7;'2VbF?IPVjp/sGcS5jc*,>-C2oU*,F@]gIC+o7Ch!&QY)[8N<ZR,YL3-#1493h\mAMJ:2a]HmJ`;mP,C6S>@)SKcWA9!YOcd&-"uZrHP#JJ",i;m:G7cPW.Nj@n)d-_ZCK),@LQT$15^kR\-elC<Lmk5F4Q,Lr'#XRDl;rkZ;I%oP+?)Y3"1>_e(iF2s_WJF(D7T&9:2%qt;J@;3<%W]G)'ckR9o="%,X^7c;WCU:klY[As<R/.]E:=%fr.4Wa1-bCjaWfa=3',%]d_,g)o=[J"Wl&;Y3L8jJbM!Nu+Ph-:9WF.h9/ZN^#"r:uV>)Th]m(BD6b6>(R9*<.U=16U.<pM&5%Xilbgp5#6^I\^f&`(e_/aGuOXVU^4`6P_=K_grF7n#[Q&-^S(SckIg9n8T/;5T#6Y!84$VcK!rY)eTtd.QiP6,%Oj%=6!=F3#<FgTIfhoPjD(.fQCLhLb(Z`E>Gdf4%b/RUNWX8oC\qb7<EJbL%.8ab3MrLX&b!Y1Ao;bqP_T7pBhGA&j4s[0R8>j^I"3EfdcTp"QDc))b]f,'0bFkjed@b@/f,bKrX8(M#-RA-01@/%faSLq)_onF]Rp"#G'?2iOI:Si8K<$[k#fjm$m!f,p??BM-2%cLU'A/H.Q[)ZNPRT10LZL/@u:KfkZ55K_Ci'lH2hMj>K1EkS*R!P!bL`D&]DP?]Y_[Z@3OID91GSVX1;.DZbk!R,$7KPDqm5ElPk^Oa*pOJB730nd3eNbt&I7]S5#k/E[/h!VV?CH3AbAj@1u`j2Mg>fia#+Phgb'0P.uUC5b?\Ettea.2RdVA)M((p`II+lM&(SYj.Ds(LYCgPP:>7W9'@nG@-"/mZ'uBsr6IB_o0!H_\f!HC@U8VUIL\SO1R]")%_LKCNP/mC#bA;BN<JNs4jomLsEpJ*W,JJn5h,IG'ltm[.4M.I6fO`PoVdbj-E+%I%/f$d='Zc,HNDb[,G9l*!f>NE\".RYg/<IaM'8e-_N,%MNcB<rCgjNu^'9;0SsjR?MH(DGWs1?5(U<Zp910f+L!?5N_"OM7I7BL"dV6U]1AP]hF:~>endstream
+Gau0D9lo&I&A@C2m%lL5/(4>BQ*pq<NKZ1nlGQ<KK.dc>M24`T!D'98YO;R%ac[9P*)CCs=<\%;a4oFZ$iB#Df,t"S("'?:*M</g#;f_J+1VtXs.\]*dH?X]7^4noaRp3"bp%OI?8r6^/Oqe]hoLX0aun"p1@1N3O;7]Q;.bJUgr.8p\sT)%T@1oHe(=6S_qS7j08Y^G!rp^?r#hZAIt)kFk1TA#'R2q7KVkATqQi%%:#3o:os-k^R)--XRCGPOqNRkN<LHp`j"m[7J*"n6nd3JUrZYd7FI)ei]Ej*l11Pbm$c9hXkRT\"2fc7SM_hlNp\Fg-W&ELc)-%A@.29aXGq/&fj@0`)9ur;,r1s,3JhR\L`Zg3j$K4/UB>!DbN6cUcFGoVN7B]._[p7c&'h8;oNmkTDqHF3^!Nk+?PQo56*Q6>9bn&eM#F!4fn][.=h6Yq4j>MI3$V`Tj'`H_0Q_Ig7W=gmhYT:FSR_=Ji7P&JKoR5?R@Vg&=!QtH[OMrt.=BY3@aU]8RUsZV:pI].0:j`Y*+.+DmA8sh8iX=?CFiN9^K7Ne;<'%a=T$B9&Ch\Xm+e8q9>AB*/:T9R/Ni-,_:!$U7r0ilkCPAjh'br)s8H^Z49(BP?h9@FC2;W(lD?!eq2uO"(d>n[,bBgmG6k<)=,Q$LcVEYO9"Y817[0<I#C1F'VOu<K>A_@r.`^jC7GtkVofOr[DjfH%[)f_<0TZ6os'([[-&([Ac!haUE?Ro]eM()1M?6TU/V%Y>sZ>`EbbtI'r2'o;?395[;fdUB)UEn$@0s->)6q[\:)[J`C<s<BkrZ#?&Q(4hBcUhg0FcOpeM'oX[*nnSb\pDYalfS/=C*hDqH`6Al./C]erXW6fk*kA#+&X-Hd`ajaJd/MLHWte\BKi)o.>3DSH:N,!)*h8&9O/fH/b0@UW*#N*-@c7uo9G0)_<ggl"-oSnXa[j<JuBTe>!430M\atq^+c%<U2E$0._K3TAdRNZkSN@*_Eo^XT9C$j[pDE;CIl#PD*Qlj=Xl<G]P_R).'C1fV,jj)0=Z&e,P98u(7Fp+%RE1X)_.[q4iskW@Qjds&T%TCIO3WD&^V@c!V*EBO\FIi^ru^bVF9XN5;lG8/LT(R+)DCK(HdA&!rlRHoU>A`2fCNk]>hk=a5jL%r,W+U"kP\kPE=p3Me,W7%)%'iEZ;Esm-oFqNfK2E\M0!.dQ%BPe[8-$An]L]7iQ:qA!7-&@hJ-Nb?_m#FN8=cleSK[BK#05L$)EXi8ki8QG]FKQ_B5:0CW6-n-%DOXRNei,N>`\^t1g,#KH:=08ed,RTFULB);(sPfq7FXnoPT64OH_)p+FBYkZrqlf`Q`\J(%')d3DI(A(^tr<Q&#<1&%U(*u8njS;$B%IaRUMOT3N-ZcQFa?GQos8@Uns$St\8dVZ9&'-;&NiA=2o3Jp-r%%:6(d;](0.%i\\RQYVL#FMgU1s.?3j*\]c*\N$J29G!8B.s503lVO35F@jRgED;SC*&W8k_<?gGYtAVC@3B/-bQh$j8]-\l\V:OrmD(mlHS<=UP]`'n-,SjO&t@LaH=N8(4r$ghLD<e!&hQ9rE!NEPU_,!ONEqOn#;)D72J@WD?^KLQ(mR%l#sNm[B7LYWN0"0=oU(*AcfFYb%Il>R[$WIQ\OF6+tl^JD#sf)-feUm&4DhJ#fni9XWMg3gr^Od8J*9&sDMi*H.TOgim_j6,=C]#:l0*af`kkV%i5Qi=&'['KC2%@0?D%5Al^Q3=@GZX9`@`#.jb7aZTm1]3YqjCg8XL1r^h'_#;.AUVo?cC\CL[U-!t3"<VeC(FU7Vbd:K(DN?M,W7ED"IcXO7/b6d3qfdY^P=GQSQV)i'~>endstream
 endobj
 xref
-0 19
+0 20
 0000000000 65535 f 
 0000000061 00000 n 
 0000000128 00000 n 
@@ -327,28 +334,29 @@ xref
 0000115298 00000 n 
 0000212793 00000 n 
 0000212898 00000 n 
-0000213166 00000 n 
-0000213924 00000 n 
-0000232225 00000 n 
-0000232493 00000 n 
-0000233840 00000 n 
-0000234600 00000 n 
-0000253421 00000 n 
-0000253680 00000 n 
-0000255015 00000 n 
-0000255085 00000 n 
-0000255420 00000 n 
-0000255480 00000 n 
+0000213095 00000 n 
+0000213381 00000 n 
+0000214139 00000 n 
+0000232440 00000 n 
+0000232709 00000 n 
+0000234057 00000 n 
+0000234817 00000 n 
+0000253638 00000 n 
+0000253897 00000 n 
+0000255232 00000 n 
+0000255302 00000 n 
+0000255637 00000 n 
+0000255697 00000 n 
 trailer
 <<
 /ID 
 [<74a8b4e649f7e63b10697d2fa4a53ae3><74a8b4e649f7e63b10697d2fa4a53ae3>]
 % ReportLab generated PDF document -- digest (opensource)
 
-/Info 16 0 R
-/Root 15 0 R
-/Size 19
+/Info 17 0 R
+/Root 16 0 R
+/Size 20
 >>
 startxref
-257333
+257641
 %%EOF
