@@ -104,39 +104,102 @@ def _factorize(matrix, data, *, ordering="COLAMD"):
         return None
 
 
-class _CSCWorkspace:
-    """Keep a sparsity pattern and apply the current matrix when refining a solve."""
+class _CSCPattern:
+    """Precomputed row/column reduction indices for a static CSC sparsity pattern."""
+
+    __slots__ = (
+        "shape", "indices", "indptr",
+        "row_order", "cols_in_row_order", "rows_with_terms", "row_starts", "all_rows_filled",
+        "cols_with_terms", "col_starts", "all_cols_filled",
+    )
 
     def __init__(self, size, indices, indptr):
         self.shape = (size, size)
         self.indices = indices
         self.indptr = indptr
-        self._row_order = None
+        self.row_order = None
+        self.cols_in_row_order = None
+        self.rows_with_terms = None
+        self.row_starts = None
+        self.all_rows_filled = False
+        self.cols_with_terms = None
+        self.col_starts = None
+        self.all_cols_filled = False
+
+    def ensure_ready(self):
+        if self.row_order is not None:
+            return
+        size = self.shape[0]
+        self.row_order = np.argsort(self.indices, kind="stable")
+        col_lens = np.diff(self.indptr)
+        self.cols_in_row_order = np.repeat(np.arange(size, dtype=np.intp), col_lens)[self.row_order]
+        counts = np.bincount(self.indices, minlength=size)
+        self.rows_with_terms = np.flatnonzero(counts)
+        self.all_rows_filled = int(self.rows_with_terms.size) == size
+        self.row_starts = (np.cumsum(counts) - counts)[self.rows_with_terms]
+        self.cols_with_terms = np.flatnonzero(col_lens)
+        self.all_cols_filled = int(self.cols_with_terms.size) == size
+        self.col_starts = self.indptr[self.cols_with_terms]
+
+
+class _CSCWorkspace:
+    """Keep a sparsity pattern and apply the current matrix when refining a solve."""
+
+    __slots__ = ("shape", "indices", "indptr", "pattern", "data")
+
+    def __init__(self, size, indices, indptr, pattern=None):
+        self.shape = (size, size)
+        self.indices = indices
+        self.indptr = indptr
+        self.pattern = _CSCPattern(size, indices, indptr) if pattern is None else pattern
+        self.data = None
 
     def multiply(self, values, trans):
-        if self._row_order is None:
-            size = self.shape[0]
-            self._row_order = np.argsort(self.indices, kind="stable")
-            self._cols_in_row_order = np.repeat(np.arange(size), np.diff(self.indptr))[self._row_order]
-            counts = np.bincount(self.indices, minlength=size)
-            self._rows_with_terms = np.flatnonzero(counts)
-            self._row_starts = (np.cumsum(counts) - counts)[self._rows_with_terms]
-            self._cols_with_terms = np.flatnonzero(np.diff(self.indptr))
+        p = self.pattern
+        if p.row_order is None:
+            p.ensure_ready()
+
+        if values.ndim == 1:
+            if trans == "N":
+                if p.all_rows_filled:
+                    return np.add.reduceat(self.data[p.row_order] * values[p.cols_in_row_order], p.row_starts)
+                product = np.zeros_like(values)
+                if p.rows_with_terms.size:
+                    product[p.rows_with_terms] = np.add.reduceat(
+                        self.data[p.row_order] * values[p.cols_in_row_order], p.row_starts
+                    )
+                return product
+            if trans == "H":
+                if p.all_cols_filled:
+                    out = np.add.reduceat(self.data * np.conj(values)[self.indices], p.col_starts)
+                    np.conj(out, out=out)
+                    return out
+                product = np.zeros_like(values)
+                if p.cols_with_terms.size:
+                    res = np.add.reduceat(self.data * np.conj(values)[self.indices], p.col_starts)
+                    np.conj(res, out=res)
+                    product[p.cols_with_terms] = res
+                return product
+            if p.all_cols_filled:
+                return np.add.reduceat(self.data * values[self.indices], p.col_starts)
+            product = np.zeros_like(values)
+            if p.cols_with_terms.size:
+                product[p.cols_with_terms] = np.add.reduceat(self.data * values[self.indices], p.col_starts)
+            return product
 
         if trans == "N":
-            data = self.data[self._row_order]
-            picked = values[self._cols_in_row_order]
-            starts = self._row_starts
-            filled = self._rows_with_terms
+            data = self.data[p.row_order]
+            picked = values[p.cols_in_row_order]
+            starts = p.row_starts
+            filled = p.rows_with_terms
         else:
             data = np.conj(self.data) if trans == "H" else self.data
             picked = values[self.indices]
-            starts = self.indptr[self._cols_with_terms]
-            filled = self._cols_with_terms
+            starts = p.col_starts
+            filled = p.cols_with_terms
         product = np.zeros_like(values)
         if filled.size:
-            terms = data * picked if values.ndim == 1 else data[:, None] * picked
-            product[filled] = np.add.reduceat(terms, starts, axis=0)
+            product[filled] = np.add.reduceat(data[:, None] * picked, starts, axis=0)
         return product
 
 
@@ -231,7 +294,10 @@ class _ForwardFactors:
             return factors
         if saved.dtype != values.dtype or saved.shape != values.shape:
             return None
-        if not np.array_equal(saved.view(np.void), values.view(np.void)):
+        if saved.dtype == np.complex128 and values.strides[-1] == 16:
+            if not np.array_equal(saved.view(np.uint64), values.view(np.uint64)):
+                return None
+        elif not np.array_equal(saved.view(np.void), values.view(np.void)):
             return None
         return factors
 
@@ -240,29 +306,31 @@ _signal_factors = _ForwardFactors()
 _carrier_factors = _ForwardFactors()
 
 
-def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, second_trans, *, cache="none"):
+def _solve_signal_systems(
+    topo, values, first_rhs, first_trans, second_rhs, second_trans, *, cache="none", copy_second=True
+):
     """Factor the coupled block once per frequency for both right-hand sides."""
     plan = topo.signal_block_plan
     finite = np.isfinite(values).all(axis=1)
 
     has_second = second_rhs.shape[-1] != 0
-    if has_second and second_rhs.shape[-1] == 1:
+    if has_second and second_rhs.ndim == 3 and second_rhs.shape[-1] == 1:
         second_rhs = second_rhs[..., 0]
         squeeze_second = True
     else:
         squeeze_second = False
 
     if plan is None:
-        matrix = _CSCWorkspace(topo.sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+        matrix = _CSCWorkspace(topo.sn, topo.signal_csc_indices, topo.signal_csc_indptr, topo.signal_core_csc_pattern)
         first_out = np.empty_like(first_rhs)
         second_out = np.empty_like(second_rhs)
         first = first_rhs
         second = second_rhs
         block_values = values
     else:
-        matrix = _CSCWorkspace(plan.core.size, plan.rows, plan.indptr)
+        matrix = _CSCWorkspace(plan.core.size, plan.rows, plan.indptr, topo.signal_core_csc_pattern)
         first_out = plan.prepare(values, first_rhs, first_trans)
-        second_out = plan.prepare(values, second_rhs, second_trans) if has_second else second_rhs
+        second_out = plan.prepare(values, second_rhs, second_trans, copy=copy_second) if has_second else second_rhs
         first = np.take(first_out, plan.core, axis=1)
         second = np.take(second_out, plan.core, axis=1) if has_second else second_out
         block_values = values[:, :plan.rows.size]
@@ -778,6 +846,8 @@ def _build_col_reduce_plan(targets: np.ndarray):
         return (0, int(idx[0]), None, None)
     if np.all(idx == idx[0]):
         return (0, int(idx[0]), None, None)
+    if (idx[1:] > idx[:-1]).all():
+        return (1, idx, None, None)
     order = np.argsort(idx, kind="stable")
     ordered = idx[order]
     first = np.empty(n, dtype=bool)
@@ -843,15 +913,19 @@ def build_op_group(
     fwd_out_idx = None if is_identity_out else flat_out
 
     bwd_fp = flat_pos_p if bwd_flat_pos is None else np.asarray(bwd_flat_pos, dtype=np.intp)
-    raw_gy = build_scatter_plan(flat_out)
-    gy_batches = []
-    arange_m = np.arange(m_total, dtype=np.intp)
-    for pos, dst in raw_gy:
-        fp_r = bwd_fp if pos is None else bwd_fp[pos]
-        dst_r = None if (dst.size == m_total and np.array_equal(dst, arange_m)) else dst
-        gy_batches.append((fp_r, dst_r))
-    gy_plan = tuple(gy_batches)
-    gy_full_first = bool(gy_plan) and (gy_plan[0][1] is None)
+    if is_identity_out:
+        gy_plan = ((bwd_fp, None),) if m_total > 0 else ()
+        gy_full_first = m_total > 0
+    else:
+        raw_gy = build_scatter_plan(flat_out)
+        gy_batches = []
+        arange_m = np.arange(m_total, dtype=np.intp)
+        for pos, dst in raw_gy:
+            fp_r = bwd_fp if pos is None else bwd_fp[pos]
+            dst_r = None if (dst.size == m_total and np.array_equal(dst, arange_m)) else dst
+            gy_batches.append((fp_r, dst_r))
+        gy_plan = tuple(gy_batches)
+        gy_full_first = bool(gy_plan) and (gy_plan[0][1] is None)
 
     col_scatter = []
     if sweep_rows is None:
@@ -918,6 +992,95 @@ class _OpGroup:
 
 
 # -----------------------------------------------------------------------------
+# Host-side parameter linking (eliminates XLA vmap/scatter compile cliff)
+# -----------------------------------------------------------------------------
+
+def _link_sqrt_fwd(x):
+    return np.sqrt(x)
+
+
+def _link_sqrt_deriv(x):
+    return 0.5 / np.sqrt(x)
+
+
+def _link_square_fwd(x):
+    return x * x
+
+
+def _link_square_deriv(x):
+    return 2.0 * x
+
+
+def _link_cos_deriv(x):
+    return -np.sin(x)
+
+
+def _link_log_deriv(x):
+    return 1.0 / x
+
+
+def _link_neg_deriv(x):
+    return np.full_like(x, -1.0)
+
+
+def _link_abs_deriv(x):
+    return np.where(x >= 0.0, 1.0, -1.0)
+
+
+_HOST_LINK_FUNCS = {
+    jax.numpy.sqrt: (_link_sqrt_fwd, _link_sqrt_deriv),
+    np.sqrt: (_link_sqrt_fwd, _link_sqrt_deriv),
+    jax.numpy.square: (_link_square_fwd, _link_square_deriv),
+    np.square: (_link_square_fwd, _link_square_deriv),
+    jax.numpy.exp: (np.exp, np.exp),
+    np.exp: (np.exp, np.exp),
+    jax.numpy.sin: (np.sin, np.cos),
+    np.sin: (np.sin, np.cos),
+    jax.numpy.cos: (np.cos, _link_cos_deriv),
+    np.cos: (np.cos, _link_cos_deriv),
+    jax.numpy.log: (np.log, _link_log_deriv),
+    np.log: (np.log, _link_log_deriv),
+    jax.numpy.negative: (np.negative, _link_neg_deriv),
+    np.negative: (np.negative, _link_neg_deriv),
+    jax.numpy.abs: (np.abs, _link_abs_deriv),
+    np.abs: (np.abs, _link_abs_deriv),
+}
+
+
+def resolve_host_link(fn):
+    """Return ``(fwd_fn, deriv_fn)`` for known NumPy/JAX linking functions, else None."""
+    try:
+        return _HOST_LINK_FUNCS.get(fn)
+    except TypeError:
+        return None
+
+
+def apply_host_links_fwd(bound: np.ndarray, topo: SparseTopology) -> np.ndarray:
+    """Apply pre-resolved parameter links on the host, matching simulate.py semantics."""
+    out = np.array(bound, copy=True)
+    link_input = out[0].copy()
+    for fwd_fn, _deriv_fn, src_idx, dst_idx in topo.host_linked_groups:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vals = np.real(fwd_fn(link_input[src_idx])).astype(np.float64, copy=False)
+        out[0, dst_idx] = vals
+    return out
+
+
+def apply_host_links_bwd(g_base: np.ndarray, bound_pre: np.ndarray, topo: SparseTopology) -> None:
+    """In-place exact reverse-mode VJP of ``apply_host_links_fwd``."""
+    link_input = np.asarray(bound_pre, dtype=np.float64)[0]
+    g_out_row = g_base[0]
+    g_link_in = np.zeros_like(g_out_row)
+    for _fwd_fn, deriv_fn, src_idx, dst_idx in reversed(topo.host_linked_groups):
+        g_dst = g_out_row[dst_idx].copy()
+        g_out_row[dst_idx] = 0.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g_src = g_dst * deriv_fn(link_input[src_idx])
+        np.add.at(g_link_in, src_idx, g_src)
+    g_out_row += g_link_in
+
+
+# -----------------------------------------------------------------------------
 # Sparse Topology Pytree Container (0 dynamic JAX leaves -> near-zero XLA graph)
 # -----------------------------------------------------------------------------
 
@@ -929,10 +1092,11 @@ class SparseTopology:
         "opt_param_idx", "opt_val_idx",
         "car_ch_idx", "sig_ch_idx",
         "qhd_param_idx", "qhd_placing_idx", "qhd_scatter_plan",
+        "host_linked_groups",
         "carrier_base_aug", "carrier_csc_rows", "carrier_csc_cols",
-        "carrier_csc_indices", "carrier_csc_indptr", "carrier_groups",
+        "carrier_csc_indices", "carrier_csc_indptr", "carrier_csc_pattern", "carrier_groups",
         "signal_base_aug", "signal_csc_rows", "signal_csc_cols",
-        "signal_csc_indices", "signal_csc_indptr",
+        "signal_csc_indices", "signal_csc_indptr", "signal_core_csc_pattern",
         "signal_block_plan",
         "signal_groups_static", "signal_groups_sweep",
         "signal_carrier_indices", "signal_carrier_flat_pos", "signal_carrier_scatter_plan",
@@ -1135,11 +1299,17 @@ def sparse_simulate_fwd_host(
     car_b = car_aug[:, nnz_c:]
 
     carrier = np.empty((b_car, cn), dtype=np.complex128)
-    c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
+    c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr, topo.carrier_csc_pattern)
     car_finite = np.isfinite(car_A).all(axis=1)
     saved_carrier = [] if save_factors else None
+    car_sweep = _SweepFactorization(c_matrix) if b_car > 1 else None
     for bi in range(b_car):
-        lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+        if not car_finite[bi]:
+            lu_c = None
+        elif car_sweep is not None:
+            lu_c = car_sweep.factor(car_A[bi])
+        else:
+            lu_c = _factorize(c_matrix, car_A[bi])
         if saved_carrier is not None:
             saved_carrier.append(lu_c)
         carrier[bi] = _solve_refined(c_matrix, lu_c, car_b[bi]) if lu_c is not None else np.nan
@@ -1194,11 +1364,18 @@ def sparse_simulate_fwd_host(
     c_sel_full = np.broadcast_to(c_sel, (D, b_sig, sn))
 
     # --- Signal + Adjoint Noise SuperLU solve (1 factorization per freq) ---
-    signal, w = _solve_signal_systems(
-        topo, sig_A, sig_b, "N", np.moveaxis(c_sel_full, 0, -1), "H",
-        cache="store" if save_factors else "none",
-    )
-    w = np.moveaxis(w, -1, 0)
+    if D == 1:
+        signal, w_2d = _solve_signal_systems(
+            topo, sig_A, sig_b, "N", c_sel_full[0], "H",
+            cache="store" if save_factors else "none",
+        )
+        w = w_2d[None, :, :]
+    else:
+        signal, w = _solve_signal_systems(
+            topo, sig_A, sig_b, "N", np.moveaxis(c_sel_full, 0, -1), "H",
+            cache="store" if save_factors else "none",
+        )
+        w = np.moveaxis(w, -1, 0)
 
     # --- Quantum noise readout: Re(w^H N w) ---
     n_vals = np.broadcast_to(topo.noise_base_vals[None, :], (b_car, topo.nnz_n)).copy()
@@ -1312,10 +1489,18 @@ def sparse_simulate_bwd_host(
         _vjp_np_groups(g_n_static, p_car, topo.noise_groups_static, g_p_car)
 
     # 2. Backprop through SuperLU signal + adjoint noise solve
-    lam_x_all, adjoint = _solve_signal_systems(
-        topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N", cache="reuse"
-    )
-    g_c_sel_full = np.moveaxis(np.conj(adjoint), -1, 0)
+    if D == 1:
+        bwd_second_rhs = np.conj(g_w[0])
+        lam_x_all, adjoint_2d = _solve_signal_systems(
+            topo, sig_A, g_signal, "T", bwd_second_rhs, "N", cache="reuse", copy_second=False
+        )
+        np.conj(adjoint_2d, out=adjoint_2d)
+        g_c_sel_full = adjoint_2d[None, :, :]
+    else:
+        lam_x_all, adjoint = _solve_signal_systems(
+            topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N", cache="reuse", copy_second=False
+        )
+        g_c_sel_full = np.moveaxis(np.conj(adjoint), -1, 0)
 
     # Compute gA and RHS cotangents ONLY for active signal slots in a compact buffer.
     n_act = topo.bwd_sig_n_act
@@ -1324,8 +1509,7 @@ def sparse_simulate_bwd_host(
     if n_act_a > 0:
         a_rows = topo.bwd_sig_a_rows
         a_cols = topo.bwd_sig_a_cols
-        gA = g_sig_aug[:, :n_act_a]
-        np.take(lam_x_all, a_rows, axis=1, out=gA)
+        gA = lam_x_all[:, a_rows]
         np.negative(gA, out=gA)
         gA *= signal[:, a_cols]
         if D == 1:
@@ -1339,6 +1523,7 @@ def sparse_simulate_bwd_host(
                 t2 *= g_c_sel_full[d][:, a_cols]
                 np.conj(t2, out=t2)
                 gA -= t2
+        g_sig_aug[:, :n_act_a] = gA
     if topo.bwd_sig_rhs_rows.size > 0:
         g_sig_aug[:, n_act_a:] = lam_x_all[:, topo.bwd_sig_rhs_rows]
 
@@ -1399,12 +1584,18 @@ def sparse_simulate_bwd_host(
     g_car_aug = np.empty((b_car, nnz_c + cn), dtype=np.complex128)
     c_rows = topo.carrier_csc_rows
     c_cols = topo.carrier_csc_cols
-    c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
+    c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr, topo.carrier_csc_pattern)
     car_finite = np.isfinite(car_A).all(axis=1)
     saved_carrier = _carrier_factors.take(topo, car_A)
+    car_sweep = _SweepFactorization(c_matrix) if (saved_carrier is None and b_car > 1) else None
     for bi in range(b_car):
         if saved_carrier is None:
-            lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+            if not car_finite[bi]:
+                lu_c = None
+            elif car_sweep is not None:
+                lu_c = car_sweep.factor(car_A[bi])
+            else:
+                lu_c = _factorize(c_matrix, car_A[bi])
         else:
             c_matrix.data = car_A[bi]
             lu_c = saved_carrier[bi]

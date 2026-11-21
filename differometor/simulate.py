@@ -39,6 +39,8 @@ from differometor.build import (
 from differometor.components import FUNCTIONS
 from differometor._sparse_kernel import (
     SparseTopology,
+    apply_host_links_fwd,
+    apply_host_links_bwd,
     sparse_simulate_fwd_host,
     sparse_simulate_bwd_host,
 )
@@ -153,6 +155,8 @@ def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind
     def _call(opt, base, car_sweep, sig_sweep, vectors):
         inputs = tuple(np.asarray(x) for x in (opt, base, car_sweep, sig_sweep, vectors))
         bound = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
+        if topo.host_linked_groups:
+            bound = apply_host_links_fwd(bound, topo)
         carrier, signal, noise, *residuals = sparse_simulate_fwd_host(
             topo, bound, *inputs[2:], save_factors=save_residuals
         )
@@ -176,7 +180,8 @@ def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
 
     def _call_bwd(opt, base, car_sweep, sig_sweep, vectors, carrier, signal, noise, g_carrier, g_signal, g_noise):
         inputs = tuple(np.asarray(x) for x in (opt, base, car_sweep, sig_sweep, vectors))
-        bound = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
+        bound_pre = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
+        bound = apply_host_links_fwd(bound_pre, topo) if topo.host_linked_groups else bound_pre
         residuals = _forward_tape.get(topo, bind_parameters, inputs)
         if residuals is None:
             # Another forward ran in between (or this pullback runs elsewhere): recompute exactly.
@@ -185,6 +190,8 @@ def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
             topo, bound, *inputs[2:], np.asarray(carrier).T, np.asarray(signal).T, noise,
             *residuals, np.asarray(g_carrier).T, np.asarray(g_signal).T, g_noise,
         )
+        if topo.host_linked_groups:
+            apply_host_links_bwd(g_base, bound_pre, topo)
         g_opt = np.zeros(opt.shape, dtype=g_base.dtype)
         if bind_parameters:
             indices = topo.opt_param_idx

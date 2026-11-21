@@ -56,6 +56,9 @@ from differometor.components import (
     directional_beamsplitter_matrix,
     beamsplitter_matrix,
     mirror_matrix,
+    _reflectivity_left_np,
+    _reflectivity_right_np,
+    _transmissivity_np,
     space_modulation,
     space_lower,
     space_modulation_lower,
@@ -133,6 +136,45 @@ _LOSS_NOISE_FUNC_LIST = [_IDX_LOSS_NOISE]
 _VACUUM_INP_PADDED = np.zeros((1, 7), dtype=np.int32)
 _VACUUM_OUT_COL_2 = np.zeros(2, dtype=np.int32)
 _VACUUM_FUNC_LIST = [_IDX_VACUUM_NOISE]
+_SIG_OUT_COL_1 = np.zeros(1, dtype=np.int32)
+_SIG_COL_M1 = np.array([-1], dtype=np.int32)
+_SIG_FUNC_LIST = [_IDX_SIGNAL]
+_LASER_FUNC_LIST = [_IDX_LASER]
+_SQUEEZER_OUT_COL = np.array([0, 1, 2, 3], dtype=np.int32)
+_SQUEEZER_FUNC_LIST = [_IDX_SQUEEZER]
+_SPACE_CAR_OUT_COL = np.zeros(2, dtype=np.int32)
+_SPACE_CAR_FUNC_LIST = [_IDX_SPACE]
+_SPACE_SIG_OUT_ROW = np.array([0, 0, 1, 1], dtype=np.int32)
+_SPACE_SIG_OUT_COL = np.zeros(4, dtype=np.int32)
+_SPACE_SIG_FUNC_LIST = [_IDX_SPACE, _IDX_SPACE_LOWER]
+_SPACE_MOD_OUT_COL_1 = np.zeros(4, dtype=np.int32)
+_SPACE_MOD_OUT_ROW_1 = np.array([0, 0, 1, 1], dtype=np.int32)
+_SPACE_MOD_FUNC_LIST_1 = [_IDX_SPACE_MOD, _IDX_SPACE_MOD_LOWER]
+_FM_FUNC_LIST = [
+    _IDX_SUSCEPTIBILITY,
+    _IDX_FORCE_LEFT,
+    _IDX_FORCE_RIGHT,
+    _IDX_OM_PHASE_LEFT,
+    _IDX_OM_PHASE_RIGHT,
+]
+_FM_MIRROR_OUT_ROW = np.array([0, 1, 1, 2, 2, 3, 4, 3, 4, 1, 1, 2, 2], dtype=np.int32)
+_FM_MIRROR_OUT_COL = np.zeros(13, dtype=np.int32)
+_FM_MIRROR_CAR_OFF = np.array([0, 1, 2, 3, 0, 2, 0, 2, 0, 1, 2, 3], dtype=np.int32)
+_FM_BS_OUT_ROW = np.array(
+    [0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4, 1, 1, 1, 1, 2, 2, 2, 2],
+    dtype=np.int32,
+)
+_FM_BS_OUT_COL = np.zeros(25, dtype=np.int32)
+_FM_BS_CAR_OFF = np.array(
+    [0, 1, 2, 3, 4, 5, 6, 7, 2, 0, 6, 4, 2, 0, 6, 4, 0, 1, 2, 3, 4, 5, 6, 7],
+    dtype=np.int32,
+)
+_NOTHING_ROW_OFF = np.array([1, 3], dtype=np.int32)
+_NOTHING_COL_OFF = np.array([2, 0], dtype=np.int32)
+_NOTHING_VALS = np.array([-1.0, -1.0], dtype=np.complex128)
+_DBS_ROW_OFF = np.array([1, 3, 5, 7], dtype=np.int32)
+_DBS_COL_OFF = np.array([2, 6, 0, 4], dtype=np.int32)
+_DBS_VALS = np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.complex128)
 
 
 def _expand_sidebands(rows: np.ndarray, cols: np.ndarray, s: int, extra1: np.ndarray, extra2: np.ndarray | None = None):
@@ -553,8 +595,16 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
     detectors = {}
 
     # Carrier matrix: identity on the left block, with a separate right-hand-side column.
-    carrier_matrix = np.zeros((system_size, system_size + 1), dtype=complex)
-    np.fill_diagonal(carrier_matrix, 1)
+    if _sparse_signal:
+        carrier_matrix = None
+        c_diag_idx = np.arange(system_size, dtype=np.int32)
+        c_coo_r = [c_diag_idx]
+        c_coo_c = [c_diag_idx]
+        c_coo_v = [np.ones(system_size, dtype=np.complex128)]
+        c_rhs = np.zeros(system_size, dtype=np.complex128)
+    else:
+        carrier_matrix = np.zeros((system_size, system_size + 1), dtype=complex)
+        np.fill_diagonal(carrier_matrix, 1)
 
     # Ensure signal_size is at least 1 to avoid conditional logic later.
     if signal_size == 0:
@@ -604,15 +654,16 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
             parameter_names += [f"{node}_amplitude", f"{node}_phase"]
 
             # Signal acts as a right-hand-side injection into the explicit signal block.
-            set_instructions(
-                signal_instructions,
-                node,
-                function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1]]),
-                output_column_indices=np.array([0]),
-                system_matrix_row_indices=np.array([system_size * 2 + signal_index]),
-                system_matrix_column_indices=np.array([-1]),
-                function_indices=[_IDX_SIGNAL],
-            )
+            sig_inp = np.zeros((1, 7), dtype=np.int32)
+            sig_inp[0, 0] = len(parameters) - 2
+            sig_inp[0, 1] = len(parameters) - 1
+            signal_instructions[node] = {
+                "function_input_indices": sig_inp,
+                "output_column_indices": _SIG_OUT_COL_1,
+                "system_matrix_row_indices": np.array([system_size * 2 + signal_index], dtype=np.int32),
+                "system_matrix_column_indices": _SIG_COL_M1,
+                "function_indices": _SIG_FUNC_LIST,
+            }
 
         # -----------------------------
         # Lasers, detectors, squeezers
@@ -673,7 +724,11 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 target_port = data["target"].replace("_source", "").replace("_target", "") + "." + data["port"]
                 used_ports.add(target_port)
 
-                carrier_matrix[component_index, system_size] = laser_np(**data["properties"])
+                laser_val = laser_np(**data["properties"])
+                if _sparse_signal:
+                    c_rhs[component_index] = laser_val
+                else:
+                    carrier_matrix[component_index, system_size] = laser_val
 
                 parameter_linking(
                     [data["properties"]["power"], data["properties"]["phase"]],
@@ -684,26 +739,25 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 )
                 parameter_names += [f"{node}_power", f"{node}_phase"]
 
-                set_instructions(
-                    carrier_instructions,
-                    node,
-                    function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1]]),
-                    output_column_indices=np.array([0]),
-                    system_matrix_row_indices=np.array([component_index]),
-                    system_matrix_column_indices=np.array([-1]),
-                    function_indices=[_IDX_LASER],
-                )
+                laser_inp = np.zeros((1, 7), dtype=np.int32)
+                laser_inp[0, 0] = len(parameters) - 2
+                laser_inp[0, 1] = len(parameters) - 1
+                carrier_instructions[node] = {
+                    "function_input_indices": laser_inp,
+                    "output_column_indices": _SIG_OUT_COL_1,
+                    "system_matrix_row_indices": np.array([component_index], dtype=np.int32),
+                    "system_matrix_column_indices": _SIG_COL_M1,
+                    "function_indices": _LASER_FUNC_LIST,
+                }
 
-                set_instructions(
-                    noise_instructions,
-                    node,
-                    function_input_indices=np.array([[0]]),
-                    output_column_indices=np.array([0]),
-                    system_matrix_row_indices=np.array([component_index]),
-                    system_matrix_column_indices=np.array([component_index]),
-                    function_indices=[_IDX_VACUUM_NOISE],
-                    system_size_for_sidebands=system_size,
-                )
+                laser_noise_idx = np.array([component_index, component_index + system_size], dtype=np.int32)
+                noise_instructions[node] = {
+                    "function_input_indices": _VACUUM_INP_PADDED,
+                    "output_column_indices": _VACUUM_OUT_COL_2,
+                    "system_matrix_row_indices": laser_noise_idx,
+                    "system_matrix_column_indices": laser_noise_idx,
+                    "function_indices": _VACUUM_FUNC_LIST,
+                }
 
             # Squeezers transform vacuum noise entering the attached port.
             if data["component"] == "squeezer":
@@ -719,19 +773,22 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 )
                 parameter_names += [f"{node}_db", f"{node}_angle"]
 
-                set_instructions(
-                    noise_instructions,
-                    node,
-                    function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1]]),
-                    output_column_indices=np.array([0, 1, 2, 3]),
-                    system_matrix_row_indices=np.array(
-                        [component_index, component_index, component_index + system_size, component_index + system_size]
+                sq_inp = np.zeros((1, 7), dtype=np.int32)
+                sq_inp[0, 0] = len(parameters) - 2
+                sq_inp[0, 1] = len(parameters) - 1
+                noise_instructions[node] = {
+                    "function_input_indices": sq_inp,
+                    "output_column_indices": _SQUEEZER_OUT_COL,
+                    "system_matrix_row_indices": np.array(
+                        [component_index, component_index, component_index + system_size, component_index + system_size],
+                        dtype=np.int32,
                     ),
-                    system_matrix_column_indices=np.array(
-                        [component_index, component_index + system_size, component_index + system_size, component_index]
+                    "system_matrix_column_indices": np.array(
+                        [component_index, component_index + system_size, component_index + system_size, component_index],
+                        dtype=np.int32,
                     ),
-                    function_indices=[_IDX_SQUEEZER],
-                )
+                    "function_indices": _SQUEEZER_FUNC_LIST,
+                }
 
         # -----------------------------
         # Quantum homodyne detection (QHD)
@@ -765,16 +822,26 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
         # -----------------------------
         if data["component"] == "nothing":
             nothing_index = matrix_positions[node]
-            matrix = nothing_matrix()
-            carrier_matrix[nothing_index : nothing_index + matrix.shape[0], nothing_index : nothing_index + matrix.shape[1]] = matrix
+            if _sparse_signal:
+                c_coo_r.append(nothing_index + _NOTHING_ROW_OFF)
+                c_coo_c.append(nothing_index + _NOTHING_COL_OFF)
+                c_coo_v.append(_NOTHING_VALS)
+            else:
+                matrix = nothing_matrix()
+                carrier_matrix[nothing_index : nothing_index + matrix.shape[0], nothing_index : nothing_index + matrix.shape[1]] = matrix
 
         if data["component"] == "directional_beamsplitter":
             directional_beamsplitter_index = matrix_positions[node]
-            matrix = directional_beamsplitter_matrix()
-            carrier_matrix[
-                directional_beamsplitter_index : directional_beamsplitter_index + matrix.shape[0],
-                directional_beamsplitter_index : directional_beamsplitter_index + matrix.shape[1],
-            ] = matrix
+            if _sparse_signal:
+                c_coo_r.append(directional_beamsplitter_index + _DBS_ROW_OFF)
+                c_coo_c.append(directional_beamsplitter_index + _DBS_COL_OFF)
+                c_coo_v.append(_DBS_VALS)
+            else:
+                matrix = directional_beamsplitter_matrix()
+                carrier_matrix[
+                    directional_beamsplitter_index : directional_beamsplitter_index + matrix.shape[0],
+                    directional_beamsplitter_index : directional_beamsplitter_index + matrix.shape[1],
+                ] = matrix
 
         # -----------------------------
         # Mirrors and beamsplitters
@@ -787,17 +854,23 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 refractive_index_left_position = surfaces_to_refractive_index_parameter_position[node].get("left", 1)
                 refractive_index_right_position = surfaces_to_refractive_index_parameter_position[node].get("right", 1)
 
-                matrix = mirror_matrix(
-                    data["properties"]["loss"],
-                    data["properties"]["reflectivity"],
-                    data["properties"]["tuning"],
-                    F,
-                    parameters[refractive_index_left_position],
-                    parameters[refractive_index_right_position],
-                )
+                props = data["properties"]
+                loss_v = props["loss"]
+                refl_v = props["reflectivity"]
+                tuning_v = props["tuning"]
+                nl_v = parameters[refractive_index_left_position]
+                nr_v = parameters[refractive_index_right_position]
+                if _sparse_signal:
+                    abs_r = (1.0 - loss_v) * refl_v
+                    abs_t = (1.0 - loss_v) * (1.0 - refl_v)
+                    r_l = _reflectivity_left_np(abs_r, tuning_v, F, nl_v)
+                    t_v = _transmissivity_np(abs_t, tuning_v, F, nl_v, nr_v)
+                    r_r = _reflectivity_right_np(abs_r, tuning_v, F, nl_v, nr_v)
+                else:
+                    matrix = mirror_matrix(loss_v, refl_v, tuning_v, F, nl_v, nr_v)
 
                 parameter_linking(
-                    [data["properties"]["loss"], data["properties"]["reflectivity"], data["properties"]["tuning"]],
+                    [loss_v, refl_v, tuning_v],
                     indices_to_link,
                     linked_names,
                     linking_function_indices,
@@ -807,7 +880,8 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 loss_position = len(parameters) - 3
 
                 function_input_indices = np.array(
-                    [[len(parameters) - 3, len(parameters) - 2, len(parameters) - 1, 0, refractive_index_left_position, refractive_index_right_position, 2]]
+                    [[len(parameters) - 3, len(parameters) - 2, len(parameters) - 1, 0, refractive_index_left_position, refractive_index_right_position, 2]],
+                    dtype=np.int32,
                 )
                 signal_function_input_indices = np.array(
                     [
@@ -820,7 +894,8 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                             refractive_index_right_position,
                             2,
                         ]
-                    ]
+                    ],
+                    dtype=np.int32,
                 )
 
                 output_column_indices = _MIRROR_OUT_COL
@@ -831,27 +906,33 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 sig_noise_output_column_indices = _MIRROR_SIG_NOISE_OUT_COL
                 noise_system_matrix_indices = component_index + _MIRROR_NOISE_OFF
 
+                if _sparse_signal:
+                    c_coo_r.append(system_matrix_row_indices)
+                    c_coo_c.append(system_matrix_column_indices)
+                    c_coo_v.append(np.array([r_l, t_v, t_v, r_r], dtype=np.complex128))
+
             elif data["component"] == "beamsplitter":
                 refractive_index_left_position = surfaces_to_refractive_index_parameter_position[node].get("left", 1)
                 refractive_index_right_position = surfaces_to_refractive_index_parameter_position[node].get("right", 1)
 
-                matrix = beamsplitter_matrix(
-                    data["properties"]["loss"],
-                    data["properties"]["reflectivity"],
-                    data["properties"]["tuning"],
-                    F,
-                    parameters[refractive_index_left_position],
-                    parameters[refractive_index_right_position],
-                    data["properties"]["alpha"],
-                )
+                props = data["properties"]
+                loss_v = props["loss"]
+                refl_v = props["reflectivity"]
+                tuning_v = props["tuning"]
+                alpha_v = props["alpha"]
+                nl_v = parameters[refractive_index_left_position]
+                nr_v = parameters[refractive_index_right_position]
+                if _sparse_signal:
+                    abs_r = (1.0 - loss_v) * refl_v
+                    abs_t = (1.0 - loss_v) * (1.0 - refl_v)
+                    r_l = _reflectivity_left_np(abs_r, tuning_v, F, nl_v, alpha_v)
+                    t_v = _transmissivity_np(abs_t, tuning_v, F, nl_v, nr_v, alpha_v)
+                    r_r = _reflectivity_right_np(abs_r, tuning_v, F, nl_v, nr_v, alpha_v)
+                else:
+                    matrix = beamsplitter_matrix(loss_v, refl_v, tuning_v, F, nl_v, nr_v, alpha_v)
 
                 parameter_linking(
-                    [
-                        data["properties"]["loss"],
-                        data["properties"]["reflectivity"],
-                        data["properties"]["tuning"],
-                        data["properties"]["alpha"],
-                    ],
+                    [loss_v, refl_v, tuning_v, alpha_v],
                     indices_to_link,
                     linked_names,
                     linking_function_indices,
@@ -871,7 +952,8 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                             refractive_index_right_position,
                             len(parameters) - 1,
                         ]
-                    ]
+                    ],
+                    dtype=np.int32,
                 )
                 signal_function_input_indices = np.array(
                     [
@@ -884,7 +966,8 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                             refractive_index_right_position,
                             len(parameters) - 1,
                         ]
-                    ]
+                    ],
+                    dtype=np.int32,
                 )
 
                 output_column_indices = _BS_OUT_COL
@@ -895,11 +978,17 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
                 sig_noise_output_column_indices = _BS_SIG_NOISE_OUT_COL
                 noise_system_matrix_indices = component_index + _BS_NOISE_OFF
 
+                if _sparse_signal:
+                    c_coo_r.append(system_matrix_row_indices)
+                    c_coo_c.append(system_matrix_column_indices)
+                    c_coo_v.append(np.array([r_l, t_v, r_l, t_v, t_v, r_r, t_v, r_r], dtype=np.complex128))
+
             # Initialize the carrier matrix diagonal block for the surface.
-            carrier_matrix[
-                component_index : component_index + matrix.shape[0],
-                component_index : component_index + matrix.shape[1],
-            ] = matrix
+            if not _sparse_signal:
+                carrier_matrix[
+                    component_index : component_index + matrix.shape[0],
+                    component_index : component_index + matrix.shape[1],
+                ] = matrix
 
             # Carrier update instructions for the surface (function_input_indices already width 7).
             carrier_instructions[node] = {
@@ -986,7 +1075,7 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
             raise ValueError("Free mass has to be connected to either a mirror or a beamsplitter.")
 
         if target_component == "mirror":
-            free_mass_index = matrix_positions[node] + system_size
+            fm = matrix_positions[node] + 2 * system_size
 
             parameter_linking(
                 [data["properties"]["mass"]],
@@ -997,72 +1086,42 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
             )
             parameter_names += [f"{node}_mass"]
 
-            system_matrix_row_indices = np.array(
-                [
-                    free_mass_index + 1,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    component_index + 1,
-                    component_index + 3,
-                ]
-            )
-            system_matrix_column_indices = np.array(
-                [
-                    free_mass_index,
-                    component_index,
-                    component_index + 1,
-                    component_index + 2,
-                    component_index + 3,
-                    free_mass_index + 1,
-                    free_mass_index + 1,
-                ]
-            )
-
             refractive_index_left_position = surfaces_to_refractive_index_parameter_position[data["target"]].get("left", 1)
             refractive_index_right_position = surfaces_to_refractive_index_parameter_position[data["target"]].get("right", 1)
 
-            set_instructions(
-                signal_instructions,
-                node,
-                function_input_indices=np.array(
+            c = component_index
+            cs = c + system_size
+            exp_rows = np.array(
+                [fm + 1, fm, fm, fm, fm, c + 1, c + 3, cs + 1, cs + 3, fm, fm, fm, fm],
+                dtype=np.int32,
+            )
+            exp_cols = np.array(
+                [fm, c, c + 1, c + 2, c + 3, fm + 1, fm + 1, fm + 1, fm + 1, cs, cs + 1, cs + 2, cs + 3],
+                dtype=np.int32,
+            )
+            signal_instructions[node] = {
+                "function_input_indices": np.array(
                     [
                         [signal_frequency_position, len(parameters) - 1, 0, 0, 0, 0, 0],
                         [2, 0, 0, 0, 0, 0, 0],
                         [2, refractive_index_left_position, refractive_index_right_position, 0, 0, 0, 0],
                         [signal_frequency_position, parameter_position + 2, parameter_position + 1, parameter_position, refractive_index_left_position, 2, 0],
                         [signal_frequency_position, parameter_position + 2, parameter_position + 1, parameter_position, refractive_index_left_position, refractive_index_right_position, 2],
-                    ]
+                    ],
+                    dtype=np.int32,
                 ),
-                output_row_indices=np.array([0, 1, 1, 2, 2, 3, 4]),
-                output_column_indices=np.array([0] * 7),
-                system_matrix_row_indices=system_matrix_row_indices,
-                system_matrix_column_indices=system_matrix_column_indices,
-                function_indices=[
-                    _IDX_SUSCEPTIBILITY,
-                    _IDX_FORCE_LEFT,
-                    _IDX_FORCE_RIGHT,
-                    _IDX_OM_PHASE_LEFT,
-                    _IDX_OM_PHASE_RIGHT,
-                ],
-                carrier_indices=np.array(
-                    [
-                        component_index,
-                        component_index + 1,
-                        component_index + 2,
-                        component_index + 3,
-                        component_index,
-                        component_index + 2,
-                    ]
-                ),
-                carrier_row_indices=system_matrix_row_indices[1:],
-                carrier_column_indices=system_matrix_column_indices[1:],
-                system_size_for_sidebands=system_size,
-            )
+                "output_row_indices": _FM_MIRROR_OUT_ROW,
+                "output_column_indices": _FM_MIRROR_OUT_COL,
+                "system_matrix_row_indices": exp_rows,
+                "system_matrix_column_indices": exp_cols,
+                "function_indices": _FM_FUNC_LIST,
+                "carrier_indices": c + _FM_MIRROR_CAR_OFF,
+                "carrier_row_indices": exp_rows[1:],
+                "carrier_column_indices": exp_cols[1:],
+            }
 
         elif target_component == "beamsplitter":
-            free_mass_index = matrix_positions[node] + system_size
+            fm = matrix_positions[node] + 2 * system_size
 
             parameter_linking(
                 [data["properties"]["mass"]],
@@ -1073,87 +1132,51 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
             )
             parameter_names += [f"{node}_mass"]
 
-            system_matrix_row_indices = np.array(
-                [
-                    free_mass_index + 1,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    free_mass_index,
-                    component_index + 1,
-                    component_index + 3,
-                    component_index + 5,
-                    component_index + 7,
-                ]
-            )
-            system_matrix_column_indices = np.array(
-                [
-                    free_mass_index,
-                    component_index,
-                    component_index + 1,
-                    component_index + 2,
-                    component_index + 3,
-                    component_index + 4,
-                    component_index + 5,
-                    component_index + 6,
-                    component_index + 7,
-                    free_mass_index + 1,
-                    free_mass_index + 1,
-                    free_mass_index + 1,
-                    free_mass_index + 1,
-                ]
-            )
-
             refractive_index_left_position = surfaces_to_refractive_index_parameter_position[data["target"]].get("left", 1)
             refractive_index_right_position = surfaces_to_refractive_index_parameter_position[data["target"]].get("right", 1)
 
-            set_instructions(
-                signal_instructions,
-                node,
-                function_input_indices=np.array(
+            c = component_index
+            cs = c + system_size
+            exp_rows = np.array(
+                [
+                    fm + 1,
+                    fm, fm, fm, fm, fm, fm, fm, fm,
+                    c + 1, c + 3, c + 5, c + 7,
+                    cs + 1, cs + 3, cs + 5, cs + 7,
+                    fm, fm, fm, fm, fm, fm, fm, fm,
+                ],
+                dtype=np.int32,
+            )
+            exp_cols = np.array(
+                [
+                    fm,
+                    c, c + 1, c + 2, c + 3, c + 4, c + 5, c + 6, c + 7,
+                    fm + 1, fm + 1, fm + 1, fm + 1,
+                    fm + 1, fm + 1, fm + 1, fm + 1,
+                    cs, cs + 1, cs + 2, cs + 3, cs + 4, cs + 5, cs + 6, cs + 7,
+                ],
+                dtype=np.int32,
+            )
+            signal_instructions[node] = {
+                "function_input_indices": np.array(
                     [
                         [signal_frequency_position, len(parameters) - 1, 0, 0, 0, 0, 0],
                         [parameter_position + 3, 0, 0, 0, 0, 0, 0],
                         [parameter_position + 3, refractive_index_left_position, refractive_index_right_position, 0, 0, 0, 0],
                         [signal_frequency_position, parameter_position + 2, parameter_position + 1, parameter_position, refractive_index_left_position, parameter_position + 3, 0],
                         [signal_frequency_position, parameter_position + 2, parameter_position + 1, parameter_position, refractive_index_left_position, refractive_index_right_position, parameter_position + 3],
-                    ]
+                    ],
+                    dtype=np.int32,
                 ),
-                output_row_indices=np.array([0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4]),
-                output_column_indices=np.array([0] * 13),
-                system_matrix_row_indices=system_matrix_row_indices,
-                system_matrix_column_indices=system_matrix_column_indices,
-                function_indices=[
-                    _IDX_SUSCEPTIBILITY,
-                    _IDX_FORCE_LEFT,
-                    _IDX_FORCE_RIGHT,
-                    _IDX_OM_PHASE_LEFT,
-                    _IDX_OM_PHASE_RIGHT,
-                ],
-                carrier_indices=np.array(
-                    [
-                        component_index,
-                        component_index + 1,
-                        component_index + 2,
-                        component_index + 3,
-                        component_index + 4,
-                        component_index + 5,
-                        component_index + 6,
-                        component_index + 7,
-                        component_index + 2,
-                        component_index,
-                        component_index + 6,
-                        component_index + 4,
-                    ]
-                ),
-                carrier_row_indices=system_matrix_row_indices[1:],
-                carrier_column_indices=system_matrix_column_indices[1:],
-                system_size_for_sidebands=system_size,
-            )
+                "output_row_indices": _FM_BS_OUT_ROW,
+                "output_column_indices": _FM_BS_OUT_COL,
+                "system_matrix_row_indices": exp_rows,
+                "system_matrix_column_indices": exp_cols,
+                "function_indices": _FM_FUNC_LIST,
+                "carrier_indices": c + _FM_BS_CAR_OFF,
+                "carrier_row_indices": exp_rows[1:],
+                "carrier_column_indices": exp_cols[1:],
+            }
 
     # -----------------------------------------------------------------
     # Edge loop: connect components through spaces and add space instructions.
@@ -1190,91 +1213,118 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
             target_output_index = target_index
 
         # Initialize the carrier matrix with the space propagation entry (pure NumPy).
-        space_entry = -np.exp(
-            -1j * 2.0 * np.pi * F * data["properties"]["length"] * data["properties"]["refractive_index"] / C_LIGHT
-        )
-        carrier_matrix[source_input_index, target_output_index] = space_entry
-        carrier_matrix[target_input_index, source_output_index] = space_entry
+        if F == 0:
+            space_entry = -1.0 + 0.0j
+        else:
+            space_entry = -np.exp(
+                -1j * 2.0 * np.pi * F * data["properties"]["length"] * data["properties"]["refractive_index"] / C_LIGHT
+            )
+        space_key = f"{source}_{target}"
+        sp_rows = np.array([source_input_index, target_input_index], dtype=np.int32)
+        sp_cols = np.array([target_output_index, source_output_index], dtype=np.int32)
+        if _sparse_signal:
+            c_coo_r.append(sp_rows)
+            c_coo_c.append(sp_cols)
+            c_coo_v.append(np.array([space_entry, space_entry], dtype=np.complex128))
+        else:
+            carrier_matrix[source_input_index, target_output_index] = space_entry
+            carrier_matrix[target_input_index, source_output_index] = space_entry
 
-        parameter_position = parameter_positions[f"{source}_{target}"]
+        parameter_position = parameter_positions[space_key]
 
-        set_instructions(
-            carrier_instructions,
-            f"{source}_{target}",
-            function_input_indices=np.array([[0, parameter_position, parameter_position + 1]]),
-            output_column_indices=np.array([0, 0]),
-            system_matrix_row_indices=np.array([source_input_index, target_input_index]),
-            system_matrix_column_indices=np.array([target_output_index, source_output_index]),
-            function_indices=[_IDX_SPACE],
-        )
+        sp_car_inp = np.zeros((1, 7), dtype=np.int32)
+        sp_car_inp[0, 1] = parameter_position
+        sp_car_inp[0, 2] = parameter_position + 1
+        carrier_instructions[space_key] = {
+            "function_input_indices": sp_car_inp,
+            "output_column_indices": _SPACE_CAR_OUT_COL,
+            "system_matrix_row_indices": sp_rows,
+            "system_matrix_column_indices": sp_cols,
+            "function_indices": _SPACE_CAR_FUNC_LIST,
+        }
 
         # Signal run: update both sidebands. Lower sideband uses `space_lower`.
-        set_instructions(
-            signal_instructions,
-            f"{source}_{target}",
-            function_input_indices=np.array(
-                [
-                    [signal_frequency_position, parameter_position, parameter_position + 1],
-                    [signal_frequency_position, parameter_position, parameter_position + 1],
-                ]
-            ),
-            output_row_indices=np.array([0, 0, 1, 1]),
-            output_column_indices=np.array([0, 0, 0, 0]),
-            system_matrix_row_indices=np.array(
+        sp_sig_inp = np.zeros((2, 7), dtype=np.int32)
+        sp_sig_inp[:, 0] = signal_frequency_position
+        sp_sig_inp[:, 1] = parameter_position
+        sp_sig_inp[:, 2] = parameter_position + 1
+        signal_instructions[space_key] = {
+            "function_input_indices": sp_sig_inp,
+            "output_row_indices": _SPACE_SIG_OUT_ROW,
+            "output_column_indices": _SPACE_SIG_OUT_COL,
+            "system_matrix_row_indices": np.array(
                 [
                     source_input_index,
                     target_input_index,
                     source_input_index + system_size,
                     target_input_index + system_size,
-                ]
+                ],
+                dtype=np.int32,
             ),
-            system_matrix_column_indices=np.array(
+            "system_matrix_column_indices": np.array(
                 [
                     target_output_index,
                     source_output_index,
                     target_output_index + system_size,
                     source_output_index + system_size,
-                ]
+                ],
+                dtype=np.int32,
             ),
-            function_indices=[_IDX_SPACE, _IDX_SPACE_LOWER],
-        )
+            "function_indices": _SPACE_SIG_FUNC_LIST,
+        }
 
         # Space strain signals inject into the signal connector columns.
-        if f"{source}_{target}" in space_to_signals:
-            signal_matrix_indices = []
-            for signal in space_to_signals[f"{source}_{target}"]:
-                signal_index = matrix_positions[signal]
-                signal_matrix_indices += [system_size * 2 + signal_index] * 4
-
-            space_signal_number = len(space_to_signals[f"{source}_{target}"])
-
-            system_matrix_row_indices = np.array(
-                [source_input_index, target_input_index, source_input_index + system_size, target_input_index + system_size]
-                * space_signal_number
-            )
-            system_matrix_column_indices = np.array(signal_matrix_indices)
-
-            set_instructions(
-                signal_instructions,
-                f"{source}_{target}_modulation",
-                function_input_indices=np.tile(
-                    np.array(
-                        [
-                            [signal_frequency_position, parameter_position, parameter_position + 1],
-                            [signal_frequency_position, parameter_position, parameter_position + 1],
-                        ]
+        if space_key in space_to_signals:
+            sigs = space_to_signals[space_key]
+            space_signal_number = len(sigs)
+            if space_signal_number == 1:
+                sig_col = system_size * 2 + matrix_positions[sigs[0]]
+                mod_rows = np.array(
+                    [source_input_index, target_input_index, source_input_index + system_size, target_input_index + system_size],
+                    dtype=np.int32,
+                )
+                mod_cols = np.array([sig_col, sig_col, sig_col, sig_col], dtype=np.int32)
+                signal_instructions[f"{space_key}_modulation"] = {
+                    "function_input_indices": sp_sig_inp,
+                    "output_column_indices": _SPACE_MOD_OUT_COL_1,
+                    "output_row_indices": _SPACE_MOD_OUT_ROW_1,
+                    "system_matrix_row_indices": mod_rows,
+                    "system_matrix_column_indices": mod_cols,
+                    "function_indices": _SPACE_MOD_FUNC_LIST_1,
+                    "carrier_indices": np.array(
+                        [source_input_index, target_input_index, source_input_index, target_input_index],
+                        dtype=np.int32,
                     ),
-                    (space_signal_number, 1),
-                ),
-                output_column_indices=np.array([0, 0, 0, 0] * space_signal_number),
-                output_row_indices=np.repeat(np.arange(space_signal_number * 2), 2),
-                system_matrix_row_indices=system_matrix_row_indices,
-                system_matrix_column_indices=system_matrix_column_indices,
-                function_indices=[_IDX_SPACE_MOD, _IDX_SPACE_MOD_LOWER] * space_signal_number,
-                carrier_indices=np.array([source_input_index, target_input_index, source_input_index, target_input_index] * space_signal_number),
-                carrier_row_indices=system_matrix_row_indices,
-                carrier_column_indices=system_matrix_column_indices,
-            )
+                    "carrier_row_indices": mod_rows,
+                    "carrier_column_indices": mod_cols,
+                }
+            else:
+                signal_matrix_indices = []
+                for signal in sigs:
+                    signal_index = matrix_positions[signal]
+                    signal_matrix_indices += [system_size * 2 + signal_index] * 4
+
+                system_matrix_row_indices = np.array(
+                    [source_input_index, target_input_index, source_input_index + system_size, target_input_index + system_size]
+                    * space_signal_number,
+                    dtype=np.int32,
+                )
+                system_matrix_column_indices = np.array(signal_matrix_indices, dtype=np.int32)
+                signal_instructions[f"{space_key}_modulation"] = {
+                    "function_input_indices": np.tile(sp_sig_inp, (space_signal_number, 1)),
+                    "output_column_indices": np.zeros(4 * space_signal_number, dtype=np.int32),
+                    "output_row_indices": np.repeat(np.arange(space_signal_number * 2, dtype=np.int32), 2),
+                    "system_matrix_row_indices": system_matrix_row_indices,
+                    "system_matrix_column_indices": system_matrix_column_indices,
+                    "function_indices": _SPACE_MOD_FUNC_LIST_1 * space_signal_number,
+                    "carrier_indices": np.array(
+                        [source_input_index, target_input_index, source_input_index, target_input_index]
+                        * space_signal_number,
+                        dtype=np.int32,
+                    ),
+                    "carrier_row_indices": system_matrix_row_indices,
+                    "carrier_column_indices": system_matrix_column_indices,
+                }
 
     # Insert carrier matrix into both sideband blocks of the signal matrix.
     if not _sparse_signal:
@@ -1320,11 +1370,16 @@ def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
     param_name_to_idx = {name: i for i, name in enumerate(parameter_names)}
     linked_indices = [param_name_to_idx[name] for name in linked_names]
     if not as_jax:
+        carrier_out = (
+            (system_size, np.concatenate(c_coo_r), np.concatenate(c_coo_c), np.concatenate(c_coo_v), c_rhs)
+            if _sparse_signal
+            else carrier_matrix
+        )
         return (
             (carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names),
             (
                 np.array([parameters], dtype=np.complex128),
-                carrier_matrix,
+                carrier_out,
                 signal_matrix,
                 noise_matrix,
                 noise_selection_vectors,
@@ -1934,7 +1989,7 @@ def build_sparse_simulation_arrays(
     optimization_pairs: list | None = None,
 ):
     """Build compact sparse CSC topology and minimal JAX arrays for `simulate`."""
-    from differometor._sparse_kernel import SparseTopology
+    from differometor._sparse_kernel import SparseTopology, _CSCPattern, resolve_host_link
     from differometor._sparse_blocks import build_scatter_plan, plan_signal_blocks
 
     instructions, matrices, metadata = build(setup, as_jax=False, _sparse_signal=True)
@@ -2064,8 +2119,8 @@ def build_sparse_simulation_arrays(
         sig_sweep_rows = np.full(parameters_np.shape[1], -1, dtype=np.intp)
         sig_sweep_rows[sig_ch_idx_np] = np.arange(sig_ch_idx_np.size, dtype=np.intp)
 
-    # --- Carrier CSC & grouped updates ---
-    cn = carrier_matrix_np.shape[0]
+    # --- Carrier CSC & grouped updates (direct COO, skipping dense cn x (cn+1)) ---
+    cn, c_base_r, c_base_c, c_base_v, c_base_rhs = carrier_matrix_np
     if len(carrier_arrays_raw["function_input_indices"]) > 0:
         c_inp = np.vstack(carrier_arrays_raw["function_input_indices"]).astype(np.int32)
         c_out_r = np.concatenate(carrier_arrays_raw["output_row_indices"]).astype(np.int32)
@@ -2079,11 +2134,8 @@ def build_sparse_simulation_arrays(
         c_mat_r = np.zeros((0,), dtype=np.int32)
         c_mat_c = np.zeros((0,), dtype=np.int32)
 
-    c_base_A = carrier_matrix_np[:, :cn]
-    c_base_r, c_base_c = np.nonzero(c_base_A)
-    c_base_v = c_base_A[c_base_r, c_base_c]
     c_base_aug, c_rows, c_cols, c_indices, c_indptr, c_keys, c_nnz = _pack_sparse_csc_coo(
-        cn, c_base_r, c_base_c, c_base_v, carrier_matrix_np[:, cn], c_mat_r, c_mat_c
+        cn, c_base_r, c_base_c, c_base_v, c_base_rhs, c_mat_r, c_mat_c
     )
     if len(c_mat_r) > 0:
         c_flat_pos = _map_rc_to_flat_pos(c_mat_r, c_mat_c, c_keys, c_nnz, cn)
@@ -2235,18 +2287,50 @@ def build_sparse_simulation_arrays(
         noise_grad_positions[noise_grad_order], return_index=True
     )
 
-    # --- Linked parameter groups (empty dict when unused) ---
+    # --- Linked parameter groups (resolved on host when possible; JAX fallback otherwise) ---
     linked_groups = {}
+    host_linked_groups = ()
     if len(linked_indices_np) > 0:
-        tmp_links: dict[int, tuple[list[int], list[int]]] = {}
-        for src, f_i, dst in zip(linked_indices_np, linking_function_indices_np, indices_to_link_np):
+        # Preserve original simulate.py write order: sorted by linking function index, stable within ties.
+        link_order = np.argsort(linking_function_indices_np, kind="stable")
+        ord_src = linked_indices_np[link_order]
+        ord_fi = linking_function_indices_np[link_order]
+        ord_dst = indices_to_link_np[link_order]
+        # Keep only the final write to each destination, matching JAX .at[dst].set(vals).
+        _, last_rev = np.unique(ord_dst[::-1], return_index=True)
+        keep = np.sort(ord_dst.size - 1 - last_rev)
+        ord_src = ord_src[keep]
+        ord_fi = ord_fi[keep]
+        ord_dst = ord_dst[keep]
+
+        host_buckets: dict[tuple, tuple[list[int], list[int]]] = {}
+        jax_buckets: dict[int, tuple[int, list[int], list[int]]] = {}
+        all_host = True
+        for src, f_i, dst in zip(ord_src, ord_fi, ord_dst):
             fi = int(f_i)
-            if fi not in tmp_links:
-                tmp_links[fi] = ([], [])
-            tmp_links[fi][0].append(int(src))
-            tmp_links[fi][1].append(int(dst))
-        for fi, (srcs, dsts) in sorted(tmp_links.items()):
-            linked_groups[fi] = (jnp.asarray(srcs, dtype=jnp.int32), jnp.asarray(dsts, dtype=jnp.int32))
+            fn = LINKING_FUNCTIONS[fi]
+            pair_fns = resolve_host_link(fn)
+            if pair_fns is None:
+                all_host = False
+            elif all_host:
+                if pair_fns not in host_buckets:
+                    host_buckets[pair_fns] = ([], [])
+                host_buckets[pair_fns][0].append(int(src))
+                host_buckets[pair_fns][1].append(int(dst))
+            fn_id = id(fn)
+            if fn_id not in jax_buckets:
+                jax_buckets[fn_id] = (fi, [], [])
+            jax_buckets[fn_id][1].append(int(src))
+            jax_buckets[fn_id][2].append(int(dst))
+
+        if all_host:
+            host_linked_groups = tuple(
+                (pair_fns[0], pair_fns[1], np.asarray(srcs, dtype=np.intp), np.asarray(dsts, dtype=np.intp))
+                for pair_fns, (srcs, dsts) in host_buckets.items()
+            )
+        else:
+            for fi, srcs, dsts in jax_buckets.values():
+                linked_groups[fi] = (jnp.asarray(srcs, dtype=jnp.int32), jnp.asarray(dsts, dtype=jnp.int32))
 
     opt_param_idx_np = np.asarray(optimized_parameter_indices, dtype=np.intp)
     opt_val_idx_np = np.asarray(optimization_value_indices, dtype=np.intp)
@@ -2258,6 +2342,14 @@ def build_sparse_simulation_arrays(
     s_rows_i64 = s_rows.astype(np.intp)
     s_cols_i64 = s_cols.astype(np.intp)
     qhd_param_idx_p = np.asarray(qhd_parameter_indices_np, dtype=np.intp)
+    signal_block_plan = plan_signal_blocks(sn, s_rows, s_cols, unit_slots=s_unit_slots[:s_nnz])
+    carrier_csc_pattern = _CSCPattern(cn, c_indices, c_indptr)
+    if signal_block_plan is None:
+        signal_core_csc_pattern = _CSCPattern(sn, s_indices, s_indptr)
+    else:
+        signal_core_csc_pattern = _CSCPattern(
+            signal_block_plan.core.size, signal_block_plan.rows, signal_block_plan.indptr
+        )
 
     topology = SparseTopology(
         cn=cn,
@@ -2273,18 +2365,21 @@ def build_sparse_simulation_arrays(
         qhd_param_idx=qhd_param_idx_p,
         qhd_placing_idx=qhd_placing_indices_np,
         qhd_scatter_plan=build_scatter_plan(qhd_param_idx_p),
+        host_linked_groups=host_linked_groups,
         carrier_base_aug=c_base_aug,
         carrier_csc_rows=c_rows.astype(np.intp),
         carrier_csc_cols=c_cols.astype(np.intp),
         carrier_csc_indices=c_indices,
         carrier_csc_indptr=c_indptr,
+        carrier_csc_pattern=carrier_csc_pattern,
         carrier_groups=carrier_groups,
         signal_base_aug=s_base_aug,
         signal_csc_rows=s_rows_i64,
         signal_csc_cols=s_cols_i64,
         signal_csc_indices=s_indices,
         signal_csc_indptr=s_indptr,
-        signal_block_plan=plan_signal_blocks(sn, s_rows, s_cols, unit_slots=s_unit_slots[:s_nnz]),
+        signal_core_csc_pattern=signal_core_csc_pattern,
+        signal_block_plan=signal_block_plan,
         signal_groups_static=signal_groups_static,
         signal_groups_sweep=signal_groups_sweep,
         signal_carrier_indices=s_car_idx,

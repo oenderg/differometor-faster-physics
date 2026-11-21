@@ -13,6 +13,8 @@ def build_scatter_plan(indices: np.ndarray):
     idx = np.asarray(indices, dtype=np.intp)
     if idx.size == 0:
         return ()
+    if idx.size == 1 or (idx[1:] > idx[:-1]).all():
+        return ((None, idx),)
     order = np.argsort(idx, kind="stable")
     ordered = idx[order]
     first = np.empty(ordered.size, dtype=bool)
@@ -211,8 +213,8 @@ class SignalBlockPlan:
         np.negative(values[:, self.coupling_slots], out=numeric[:, tail_offset:])
         return numeric
 
-    def prepare(self, values, rhs, trans):
-        result = rhs.copy()
+    def prepare(self, values, rhs, trans, copy=True):
+        result = rhs.copy() if copy else rhs
         buf = result[:, :, 0] if (result.ndim == 3 and result.shape[2] == 1) else result
         if trans == "N":
             couplings = values[:, self._tail_offset : self._tail_offset + self._split_offset]
