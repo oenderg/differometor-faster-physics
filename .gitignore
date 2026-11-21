@@ -13,3 +13,4 @@ examples/results/
 
 # team tooling
 .bench/
+uv.lock
