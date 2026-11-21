@@ -20,10 +20,17 @@ def _configure_compiler():
         jaxlib_version = _jaxlib_version.__version__
     except Exception:  # pragma: no cover - jaxlib layout differs
         jaxlib_version = ""
-    flag = "--xla_cpu_use_fusion_emitters=false"
+    flags = {
+        "xla_cpu_use_fusion_emitters": "false",
+        # With the fusion emitters off, all kernels share one LLVM module. By default XLA splits it into
+        # up to 32 parts for parallel codegen; each part is printed, cloned via bitcode and compiled on
+        # its own. Compiling it as one part does the same work with less overhead (bit-identical code).
+        "xla_cpu_parallel_codegen_split_count": "1",
+    }
     existing = _os.environ.get("XLA_FLAGS", "")
-    if jaxlib_version.startswith("0.9.") and "xla_cpu_use_fusion_emitters" not in existing:
-        _os.environ["XLA_FLAGS"] = f"{existing} {flag}".strip()
+    if jaxlib_version.startswith("0.9."):
+        added = [f"--{name}={value}" for name, value in flags.items() if name not in existing]
+        _os.environ["XLA_FLAGS"] = " ".join([existing, *added]).strip()
 
     try:
         import jax
