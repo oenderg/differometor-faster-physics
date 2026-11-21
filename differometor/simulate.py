@@ -25,6 +25,7 @@ from time import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from threading import Lock
 from jax import lax, vmap, jit
 
 from differometor.setups import Setup
@@ -102,34 +103,62 @@ def _sparse_simulate_core(
     )
 
 
+class _ForwardTape:
+    """Keep the forward's host residuals for the matching pullback, outside JAX.
+
+    The reverse pass needs large intermediate arrays (assembled matrices, adjoint fields). Returning
+    them through `pure_callback` copies them into XLA buffers and back. Instead the forward keeps
+    them here together with a copy of its (small) inputs. The pullback uses them only if its inputs
+    are byte-identical and the topology is the same object; the forward is deterministic, so the
+    residuals are then exactly the ones it would recompute. Otherwise it recomputes them.
+    """
+
+    def __init__(self):
+        self._lock = Lock()
+        self._entry = None
+
+    @staticmethod
+    def _key(arrays):
+        return tuple((a.dtype.str, a.shape, a.tobytes()) for a in arrays)
+
+    def save(self, topo, bind, inputs, residuals):
+        entry = (topo, bind, self._key(inputs), tuple(residuals))
+        with self._lock:
+            self._entry = entry
+
+    def get(self, topo, bind, inputs):
+        with self._lock:
+            entry = self._entry
+        if entry is None or entry[0] is not topo or entry[1] != bind:
+            return None
+        if entry[2] != self._key(inputs):
+            return None
+        return entry[3]
+
+
+_forward_tape = _ForwardTape()
+
+
 def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters, *, save_residuals):
     b_car = car_ch_vals.shape[1] if topo.car_ch_idx.size > 0 else 1
     b_sig = sig_ch_vals.shape[1] if topo.sig_ch_idx.size > 0 else b_car
-    b_n = b_sig if topo.noise_groups_sweep else b_car
     D = topo.num_detectors
-    signal_tape_size = topo.nnz_s if topo.signal_block_plan is None else topo.signal_block_plan.buffer_size
 
     specs = (
         jax.ShapeDtypeStruct((topo.cn, b_car), jnp.complex128),
         jax.ShapeDtypeStruct((topo.sn, b_sig), jnp.complex128),
         jax.ShapeDtypeStruct((D, b_sig), jnp.float64),
-        jax.ShapeDtypeStruct((b_car, topo.nnz_c), jnp.complex128),
-        jax.ShapeDtypeStruct((b_sig, signal_tape_size), jnp.complex128),
-        jax.ShapeDtypeStruct((D, b_sig, topo.sn), jnp.complex128),
-        jax.ShapeDtypeStruct((b_n, topo.nnz_n), jnp.complex128),
-        jax.ShapeDtypeStruct((b_sig, topo.signal_carrier_flat_pos.size), jnp.complex128),
     )
 
-    if not save_residuals:
-        specs = specs[:3]
-
     def _call(opt, base, car_sweep, sig_sweep, vectors):
-        bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
+        inputs = tuple(np.asarray(x) for x in (opt, base, car_sweep, sig_sweep, vectors))
+        bound = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
         carrier, signal, noise, *residuals = sparse_simulate_fwd_host(
-            topo, bound, car_sweep, sig_sweep, vectors, save_factors=save_residuals
+            topo, bound, *inputs[2:], save_factors=save_residuals
         )
-        outputs = (carrier.T, signal.T, noise)
-        return (*outputs, *residuals) if save_residuals else outputs
+        if save_residuals:
+            _forward_tape.save(topo, bind_parameters, inputs, residuals)
+        return carrier.T, signal.T, noise
 
     return jax.pure_callback(
         _call, specs, optimized, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential"
@@ -139,17 +168,21 @@ def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind
 def _sparse_simulate_core_fwd(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters):
     inputs = (optimized, p_base, car_ch_vals, sig_ch_vals, nsv)
     results = _sparse_forward(*inputs, topo, bind_parameters, save_residuals=True)
-    return results[:3], (*inputs, *results)
+    return results, (*inputs, *results)
 
 
 def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
     specs = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in res[:5])
 
-    def _call_bwd(opt, base, car_sweep, sig_sweep, vectors, carrier, signal, noise, *values):
-        bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
-        *residuals, g_carrier, g_signal, g_noise = values
+    def _call_bwd(opt, base, car_sweep, sig_sweep, vectors, carrier, signal, noise, g_carrier, g_signal, g_noise):
+        inputs = tuple(np.asarray(x) for x in (opt, base, car_sweep, sig_sweep, vectors))
+        bound = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
+        residuals = _forward_tape.get(topo, bind_parameters, inputs)
+        if residuals is None:
+            # Another forward ran in between (or this pullback runs elsewhere): recompute exactly.
+            _, _, _, *residuals = sparse_simulate_fwd_host(topo, bound, *inputs[2:], save_factors=True)
         g_base, *rest = sparse_simulate_bwd_host(
-            topo, bound, car_sweep, sig_sweep, vectors, np.asarray(carrier).T, np.asarray(signal).T, noise,
+            topo, bound, *inputs[2:], np.asarray(carrier).T, np.asarray(signal).T, noise,
             *residuals, np.asarray(g_carrier).T, np.asarray(g_signal).T, g_noise,
         )
         g_opt = np.zeros(opt.shape, dtype=g_base.dtype)

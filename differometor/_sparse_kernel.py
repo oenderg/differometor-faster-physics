@@ -191,6 +191,21 @@ class _FrequencySolver:
         return self.lu.solve(rhs[self.order], trans=trans)
 
 
+def _same_memory(a, b):
+    """True if both arrays are the same object or identical views of one live buffer."""
+    if a is b:
+        return True
+    root = a.base
+    return (
+        root is not None
+        and root is b.base
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.strides == b.strides
+        and a.ctypes.data == b.ctypes.data
+    )
+
+
 class _ForwardFactors:
     """Transfer one sweep's numerical factors from the forward callback to a pullback."""
 
@@ -199,7 +214,8 @@ class _ForwardFactors:
         self._entry = None
 
     def save(self, topology, values, factors):
-        entry = (topology, values.copy(), factors)
+        # The forward never writes to `values` after this point, and neither does anyone else.
+        entry = (topology, values, factors)
         with self._lock:
             self._entry = entry
 
@@ -211,6 +227,8 @@ class _ForwardFactors:
         if entry is None or entry[0] is not topology:
             return None
         _, saved, factors = entry
+        if _same_memory(saved, values):  # the host tape hands the pullback the forward's own array
+            return factors
         if saved.dtype != values.dtype or saved.shape != values.shape:
             return None
         if not np.array_equal(saved.view(np.void), values.view(np.void)):
