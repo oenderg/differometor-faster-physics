@@ -1975,6 +1975,7 @@ def build_sparse_simulation_arrays(
 ):
     """Build compact sparse CSC topology and minimal JAX arrays for `simulate`."""
     from differometor._sparse_kernel import SparseTopology
+    from differometor._sparse_blocks import plan_signal_blocks
 
     instructions, matrices, metadata = build(setup, as_jax=False)
     carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names = instructions
@@ -2165,6 +2166,11 @@ def build_sparse_simulation_arrays(
     else:
         s_car_flat_pos = np.zeros((0,), dtype=np.int32)
 
+    s_unit_slots = s_base_aug == 1
+    if len(s_mat_r):
+        s_unit_slots[s_flat_pos] = False
+    s_unit_slots[s_car_flat_pos] = False
+
     conj_mask = np.zeros(s_nnz + sn, dtype=bool)
     conj_mask[:s_nnz] = (
         ((s_rows >= cn) & (s_rows < 2 * cn) & (s_cols >= cn) & (s_cols < 2 * cn))
@@ -2201,6 +2207,12 @@ def build_sparse_simulation_arrays(
         noise_cols = np.zeros((0,), dtype=np.int32)
         noise_base_vals = np.zeros((0,), dtype=np.complex128)
         noise_groups_static, noise_groups_sweep = (), ()
+
+    noise_grad_positions = np.concatenate((noise_rows, noise_cols))
+    noise_grad_order = np.argsort(noise_grad_positions, kind="stable")
+    noise_grad_indices, noise_grad_starts = np.unique(
+        noise_grad_positions[noise_grad_order], return_index=True
+    )
 
     # --- Linked parameter groups (empty dict when unused) ---
     linked_groups = {}
@@ -2246,6 +2258,7 @@ def build_sparse_simulation_arrays(
         signal_csc_cols=s_cols.astype(np.int64),
         signal_csc_indices=s_indices,
         signal_csc_indptr=s_indptr,
+        signal_block_plan=plan_signal_blocks(sn, s_rows, s_cols, unit_slots=s_unit_slots[:s_nnz]),
         signal_groups_static=signal_groups_static,
         signal_groups_sweep=signal_groups_sweep,
         signal_carrier_indices=s_car_idx,
@@ -2256,6 +2269,9 @@ def build_sparse_simulation_arrays(
         noise_cols=noise_cols,
         noise_groups_static=noise_groups_static,
         noise_groups_sweep=noise_groups_sweep,
+        noise_grad_order=noise_grad_order,
+        noise_grad_starts=noise_grad_starts,
+        noise_grad_indices=noise_grad_indices,
     )
 
     if len(optimized_parameter_indices) == 0:

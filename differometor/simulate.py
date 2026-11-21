@@ -107,13 +107,14 @@ def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind
     b_sig = sig_ch_vals.shape[1] if topo.sig_ch_idx.size > 0 else b_car
     b_n = b_sig if topo.noise_groups_sweep else b_car
     D = topo.num_detectors
+    signal_tape_size = topo.nnz_s if topo.signal_block_plan is None else topo.signal_block_plan.buffer_size
 
     specs = (
         jax.ShapeDtypeStruct((topo.cn, b_car), jnp.complex128),
         jax.ShapeDtypeStruct((topo.sn, b_sig), jnp.complex128),
         jax.ShapeDtypeStruct((D, b_sig), jnp.float64),
         jax.ShapeDtypeStruct((b_car, topo.nnz_c), jnp.complex128),
-        jax.ShapeDtypeStruct((b_sig, topo.nnz_s), jnp.complex128),
+        jax.ShapeDtypeStruct((b_sig, signal_tape_size), jnp.complex128),
         jax.ShapeDtypeStruct((D, b_sig, topo.sn), jnp.complex128),
         jax.ShapeDtypeStruct((b_n, topo.nnz_n), jnp.complex128),
         jax.ShapeDtypeStruct((b_sig, topo.signal_carrier_flat_pos.size), jnp.complex128),

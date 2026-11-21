@@ -64,6 +64,8 @@ def _load_pinned_superlu():
 
 
 _gstrf = _load_pinned_superlu()
+_LU_PANEL_SIZE = 4
+_LU_RELAX = 2
 
 
 def _make_sparse_matrix(*args, **kwargs):
@@ -79,13 +81,19 @@ def _factorize(matrix, data, *, ordering="COLAMD"):
         if _gstrf is not None:
             return _gstrf(
                 matrix.shape[0], data.size, data, matrix.indices, matrix.indptr,
-                ilu=False, options={"ColPerm": ordering, "DiagPivotThresh": 1.0},
+                ilu=False,
+                options={
+                    "ColPerm": ordering,
+                    "DiagPivotThresh": 1.0,
+                    "PanelSize": _LU_PANEL_SIZE,
+                    "Relax": _LU_RELAX,
+                },
                 csc_construct_func=_make_sparse_matrix,
             )
         from scipy.sparse.linalg import splu
 
         csc = _make_sparse_matrix((data, matrix.indices, matrix.indptr), shape=matrix.shape)
-        return splu(csc, permc_spec=ordering, diag_pivot_thresh=1.0)
+        return splu(csc, permc_spec=ordering, diag_pivot_thresh=1.0, panel_size=_LU_PANEL_SIZE, relax=_LU_RELAX)
     except RuntimeError as error:
         if "singular" not in str(error).lower():
             raise
@@ -168,6 +176,68 @@ def _solve_refined(matrix, factors, rhs, trans="N"):
     solution = factors.solve(rhs, trans=trans)
     residual = rhs - matrix.multiply(solution, trans)
     return solution + factors.solve(residual, trans=trans)
+
+
+def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, second_trans):
+    """Factor the coupled block once per frequency for both right-hand sides."""
+    plan = topo.signal_block_plan
+    finite = np.isfinite(values).all(axis=1)
+
+    has_second = second_rhs.shape[-1] != 0
+    if has_second and second_rhs.shape[-1] == 1:
+        second_rhs = second_rhs[..., 0]
+        squeeze_second = True
+    else:
+        squeeze_second = False
+
+    if plan is None:
+        matrix = _CSCWorkspace(topo.sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+        first_out = np.empty_like(first_rhs)
+        second_out = np.empty_like(second_rhs)
+        first = first_rhs
+        second = second_rhs
+        block_values = values
+    else:
+        matrix = _CSCWorkspace(plan.core.size, plan.rows, plan.indptr)
+        first_out = plan.prepare(values, first_rhs, first_trans)
+        second_out = plan.prepare(values, second_rhs, second_trans) if has_second else second_rhs
+        first = np.take(first_out, plan.core, axis=1)
+        second = np.take(second_out, plan.core, axis=1) if has_second else second_out
+        block_values = values[:, :plan.rows.size]
+
+    failed = ~finite
+    if matrix.shape[0]:
+        # The condensed right-hand sides are private buffers and can hold the solutions.
+        first_solved = first_out if plan is None else first
+        second_solved = second_out if plan is None else second
+        sweep = _SweepFactorization(matrix)
+        for frequency, entries in enumerate(block_values):
+            factor = sweep.factor(entries) if finite[frequency] else None
+            if factor is None:
+                failed[frequency] = True
+                continue
+            first_solved[frequency] = _solve_refined(matrix, factor, first[frequency], trans=first_trans)
+            if has_second:
+                second_solved[frequency] = _solve_refined(matrix, factor, second[frequency], trans=second_trans)
+
+        if plan is not None:
+            # Ignore failed systems during substitutions, then mark the full row invalid.
+            first_solved[failed] = 0
+            first_out[:, plan.core] = first_solved
+            if has_second:
+                second_solved[failed] = 0
+                second_out[:, plan.core] = second_solved
+
+    if plan is not None:
+        plan.restore(values, first_out, first_trans)
+        if has_second:
+            plan.restore(values, second_out, second_trans)
+    first_out[failed] = np.nan
+    if has_second:
+        second_out[failed] = np.nan
+    if squeeze_second:
+        second_out = second_out[..., None]
+    return first_out, second_out
 
 
 # -----------------------------------------------------------------------------
@@ -630,10 +700,12 @@ class SparseTopology:
         "carrier_csc_indices", "carrier_csc_indptr", "carrier_groups",
         "signal_base_aug", "signal_csc_rows", "signal_csc_cols",
         "signal_csc_indices", "signal_csc_indptr",
+        "signal_block_plan",
         "signal_groups_static", "signal_groups_sweep",
         "signal_carrier_indices", "signal_carrier_flat_pos", "signal_conj_mask",
         "noise_base_vals", "noise_rows", "noise_cols",
         "noise_groups_static", "noise_groups_sweep",
+        "noise_grad_order", "noise_grad_starts", "noise_grad_indices",
         "_uid",
     )
 
@@ -663,7 +735,9 @@ def _apply_np_groups(buf: np.ndarray, params: np.ndarray, groups: tuple) -> None
         buf[:, flat_pos] = out[:, out_row, out_col]
 
 
-def _vjp_np_groups(g_buf: np.ndarray, params: np.ndarray, groups: tuple, g_params: np.ndarray) -> None:
+def _vjp_np_groups(
+    g_buf: np.ndarray, params: np.ndarray, groups: tuple, g_params: np.ndarray, sweep=None,
+) -> None:
     """Accumulate parameter gradients from sparse buffer cotangents into g_params."""
     B = params.shape[0]
     for f_idx, inp_idx, out_row, out_col, flat_pos, n_out_cols in groups:
@@ -675,7 +749,15 @@ def _vjp_np_groups(g_buf: np.ndarray, params: np.ndarray, groups: tuple, g_param
         gy = np.zeros((B, K, n_out_cols), dtype=np.complex128)
         np.add.at(gy, (slice(None), out_row, out_col), g_buf[:, flat_pos])
         gp_local = vjp(params[:, inp_idx], gy)
-        if B == 1:
+        if sweep is not None:
+            sweep_rows, g_sweep = sweep
+            flat_indices = inp_idx.ravel()
+            flat_grad = gp_local.reshape(B, -1)
+            slots = sweep_rows[flat_indices]
+            is_swept = slots >= 0
+            np.add.at(g_sweep, (slots[is_swept], slice(None)), flat_grad[:, is_swept].T)
+            np.add.at(g_params[0], flat_indices[~is_swept], flat_grad[:, ~is_swept].sum(axis=0))
+        elif B == 1:
             np.add.at(g_params[0], inp_idx.ravel(), gp_local[0].ravel())
         else:
             np.add.at(g_params, (slice(None), inp_idx.ravel()), gp_local.reshape(B, -1))
@@ -767,6 +849,9 @@ def sparse_simulate_fwd_host(
         sig_aug[:, topo.signal_conj_mask] = np.conj(sig_aug[:, topo.signal_conj_mask])
 
     sig_A = sig_aug[:, :nnz_s]
+    if topo.signal_block_plan is not None:
+        # The reverse pass reuses both this condensed matrix and its couplings.
+        sig_A = topo.signal_block_plan.pack(sig_A)
     sig_b = sig_aug[:, nnz_s:]
 
     # --- Noise selection vectors ---
@@ -783,22 +868,8 @@ def sparse_simulate_fwd_host(
     c_sel_full = np.broadcast_to(c_sel, (D, b_sig, sn))
 
     # --- Signal + Adjoint Noise SuperLU solve (1 factorization per freq) ---
-    signal = np.empty((b_sig, sn), dtype=np.complex128)
-    w = np.empty((D, b_sig, sn), dtype=np.complex128)
-    s_matrix = _CSCWorkspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
-    sweep_factors = _SweepFactorization(s_matrix)
-    sig_finite = np.isfinite(sig_A).all(axis=1)
-    for bi in range(b_sig):
-        lu_s = sweep_factors.factor(sig_A[bi]) if sig_finite[bi] else None
-        if lu_s is None:
-            signal[bi] = np.nan
-            w[:, bi] = np.nan
-            continue
-        signal[bi] = _solve_refined(s_matrix, lu_s, sig_b[bi])
-        if D == 1:
-            w[0, bi] = _solve_refined(s_matrix, lu_s, c_sel_full[0, bi], trans="H")
-        elif D > 1:
-            w[:, bi, :] = _solve_refined(s_matrix, lu_s, c_sel_full[:, bi, :].T, trans="H").T
+    signal, w = _solve_signal_systems(topo, sig_A, sig_b, "N", np.moveaxis(c_sel_full, 0, -1), "H")
+    w = np.moveaxis(w, -1, 0)
 
     # --- Quantum noise readout: Re(w^H N w) ---
     n_vals = np.broadcast_to(topo.noise_base_vals[None, :], (b_car, topo.nnz_n)).copy()
@@ -873,7 +944,13 @@ def sparse_simulate_bwd_host(
 
     g_p_base = np.zeros_like(p_base)
     g_p_car = np.zeros_like(p_car)
-    g_p_sig = np.zeros_like(p_sig)
+    g_p_sig = np.zeros_like(p_car)
+    g_sig_ch = np.zeros_like(sig_ch_vals)
+    signal_sweep = None
+    if topo.sig_ch_idx.size:
+        sweep_rows = np.full(p_car.shape[1], -1, dtype=np.int32)
+        sweep_rows[topo.sig_ch_idx] = np.arange(topo.sig_ch_idx.size)
+        signal_sweep = (sweep_rows, g_sig_ch)
     g_nsv = np.zeros_like(nsv_base)
 
     # 1. Backprop through noise = sqrt(_NOISE_SCALE * Re(w^H N w))
@@ -898,12 +975,13 @@ def sparse_simulate_bwd_host(
         # wrt w_c: Re(dw_c * (conj(w_r) * n_k)) -> g_wc = g_ts * conj(w_r) * n_k
         g_wr = g_ts[:, :, None] * np.conj(n_vals[None, :, :] * w_c)
         g_wc = g_ts[:, :, None] * (np.conj(w_r) * n_vals[None, :, :])
-        for d in range(D):
-            np.add.at(g_w[d], (slice(None), topo.noise_rows), g_wr[d])
-            np.add.at(g_w[d], (slice(None), topo.noise_cols), g_wc[d])
+        terms = np.concatenate((g_wr, g_wc), axis=2)
+        g_w[:, :, topo.noise_grad_indices] = np.add.reduceat(
+            terms[:, :, topo.noise_grad_order], topo.noise_grad_starts, axis=2,
+        )
 
         if topo.noise_groups_sweep:
-            _vjp_np_groups(g_n_vals, p_sig, topo.noise_groups_sweep, g_p_sig)
+            _vjp_np_groups(g_n_vals, p_sig, topo.noise_groups_sweep, g_p_sig, signal_sweep)
             g_n_static = g_n_vals.sum(axis=0, keepdims=True) if b_car == 1 else g_n_vals
         else:
             g_n_static = g_n_vals
@@ -911,25 +989,13 @@ def sparse_simulate_bwd_host(
 
     # 2. Backprop through SuperLU signal + adjoint noise solve
     g_sig_aug = np.empty((b_sig, nnz_s + sn), dtype=np.complex128)
-    g_c_sel_full = np.zeros((D, b_sig, sn), dtype=np.complex128)
-    lam_x_all = np.empty((b_sig, sn), dtype=np.complex128)
-    s_matrix = _CSCWorkspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
-    sweep_factors = _SweepFactorization(s_matrix)
     s_rows = topo.signal_csc_rows
     s_cols = topo.signal_csc_cols
 
-    sig_finite = np.isfinite(sig_A).all(axis=1)
-    for bi in range(b_sig):
-        lu_s = sweep_factors.factor(sig_A[bi]) if sig_finite[bi] else None
-        if lu_s is None:
-            lam_x_all[bi] = np.nan
-            g_c_sel_full[:, bi] = np.nan
-            continue
-        lam_x_all[bi] = _solve_refined(s_matrix, lu_s, g_signal[bi], trans="T")
-        if D == 1:
-            g_c_sel_full[0, bi] = np.conj(_solve_refined(s_matrix, lu_s, np.conj(g_w[0, bi])))
-        elif D > 1:
-            g_c_sel_full[:, bi, :] = np.conj(_solve_refined(s_matrix, lu_s, np.conj(g_w[:, bi, :].T))).T
+    lam_x_all, adjoint = _solve_signal_systems(
+        topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N"
+    )
+    g_c_sel_full = np.moveaxis(np.conj(adjoint), -1, 0)
 
     g_sig_aug[:, nnz_s:] = lam_x_all
     gA_all = -lam_x_all[:, s_rows] * signal[:, s_cols]
@@ -985,7 +1051,7 @@ def sparse_simulate_bwd_host(
         g_sig_aug[:, pos] = -g_pos * carrier[:, c_idx]
 
     # 6. Backprop through signal component functions (sweep & static)
-    _vjp_np_groups(g_sig_aug, p_sig, topo.signal_groups_sweep, g_p_sig)
+    _vjp_np_groups(g_sig_aug, p_sig, topo.signal_groups_sweep, g_p_sig, signal_sweep)
     if topo.signal_groups_static:
         g_sig_static = g_sig_aug.sum(axis=0, keepdims=True) if b_car == 1 else g_sig_aug
         _vjp_np_groups(g_sig_static, p_car, topo.signal_groups_static, g_p_car)
@@ -1007,6 +1073,6 @@ def sparse_simulate_bwd_host(
 
     _vjp_np_groups(g_car_aug, p_car, topo.carrier_groups, g_p_car)
 
-    g_sig_ch = _accumulate_sweep_vjp(g_p_car, g_p_sig, topo.sig_ch_idx, sig_ch_vals)
+    g_p_car += g_p_sig
     g_car_ch = _accumulate_sweep_vjp(g_p_base, g_p_car, topo.car_ch_idx, car_ch_vals)
     return g_p_base, g_car_ch, g_sig_ch, g_nsv
