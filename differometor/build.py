@@ -42,6 +42,7 @@ import jax.numpy as jnp
 from differometor.setups import Setup
 from collections import defaultdict
 from differometor.components import (
+    C_LIGHT,
     F,
     DEFAULT_REFRACTIVE_INDEX,
     DEFAULT_PROPERTIES,
@@ -404,7 +405,7 @@ def parameter_linking(
             linked_names.append(new_parameter[0])
 
 
-def build(setup: Setup):
+def build(setup: Setup, as_jax: bool = True):
     """
     Build carrier, signal, and noise matrices plus update instructions from a setup graph.
 
@@ -660,7 +661,7 @@ def build(setup: Setup):
     signal_matrix[:, : system_size * 2 + signal_size] = np.eye(system_size * 2 + signal_size, dtype=complex)
 
     # Noise matrix has the same shape as the signal matrix without the right-hand side.
-    noise_matrix = np.zeros(signal_matrix[:, :-1].shape)
+    noise_matrix = np.zeros(signal_matrix[:, :-1].shape) if as_jax else None
     noise_detectors = {}
 
     # Selection vectors map fields to detector readouts for quantum noise calculations.
@@ -1284,8 +1285,10 @@ def build(setup: Setup):
             target_input_index = target_index + 1
             target_output_index = target_index
 
-        # Initialize the carrier matrix with the space propagation entry.
-        space_entry = space(jnp.array([F, data["properties"]["length"], data["properties"]["refractive_index"]]))[0]
+        # Initialize the carrier matrix with the space propagation entry (pure NumPy).
+        space_entry = -np.exp(
+            -1j * 2.0 * np.pi * F * data["properties"]["length"] * data["properties"]["refractive_index"] / C_LIGHT
+        )
         carrier_matrix[source_input_index, target_output_index] = space_entry
         carrier_matrix[target_input_index, source_output_index] = space_entry
 
@@ -1411,7 +1414,32 @@ def build(setup: Setup):
             port_to_index[f"{node}.{port_name}.out"] = node_index + port_offset + 1
 
     # Convert linked parameter names to parameter index positions.
-    linked_indices = [parameter_names.index(name) for name in linked_names]
+    param_name_to_idx = {name: i for i, name in enumerate(parameter_names)}
+    linked_indices = [param_name_to_idx[name] for name in linked_names]
+    if not as_jax:
+        return (
+            (carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names),
+            (
+                np.array([parameters], dtype=np.complex128),
+                carrier_matrix,
+                signal_matrix,
+                noise_matrix,
+                noise_selection_vectors,
+                np.array(qhd_parameter_indices, dtype=np.int32),
+                np.array(qhd_placing_indices, dtype=np.int32),
+                np.array(linked_indices, dtype=np.int32),
+                np.array(linking_function_indices, dtype=np.int32),
+                np.array(indices_to_link, dtype=np.int32),
+            ),
+            (
+                jnp.array(detector_indices, dtype=int),
+                jnp.array(mirror_indices, dtype=int),
+                jnp.array(beamsplitter_indices, dtype=int),
+                jnp.array(isolator_indices, dtype=int),
+                port_to_index,
+            ),
+        )
+
     if len(linked_indices) == 0:
         linked_indices = [0]
         indices_to_link = [0]
@@ -1810,3 +1838,451 @@ For example for a mirror (size 4):
 - left port input is at offset 0, left port output is at offset 1
 - right port input is at offset 2, right port output is at offset 3
 """
+
+
+_FUNCTION_USED_ARGS = (
+    3,  # 0: force_calculation_right
+    2,  # 1: laser
+    7,  # 2: surface
+    3,  # 3: space
+    3,  # 4: space_modulation
+    2,  # 5: signal_function
+    0,  # 6: dummy_function
+    0,  # 7: vacuum_quantum_noise
+    1,  # 8: loss_quantum_noise
+    3,  # 9: space_lower
+    0,  # 10: laser_amplitude_modulation
+    1,  # 11: laser_frequency_modulation
+    2,  # 12: susceptibility
+    1,  # 13: force_calculation_left
+    6,  # 14: corrected_optomechanical_phase_left
+    7,  # 15: corrected_optomechanical_phase_right
+    3,  # 16: space_modulation_lower
+    2,  # 17: squeezer
+    1,  # 18: laser_frequency_modulation_lower
+)
+
+
+def _pack_sparse_csc(base_matrix: np.ndarray, extra_rows: np.ndarray, extra_cols: np.ndarray):
+    """Build static CSC structure for an augmented (N, N + 1) matrix in pure NumPy.
+
+    Returns (base_aug, csc_rows, csc_cols, csc_indices, csc_indptr, rc_to_pos, nnz_A).
+    RHS column entries (col == N or col == -1) map to flat positions [nnz_A, nnz_A + N).
+    """
+    n = base_matrix.shape[0]
+    base_A = base_matrix[:, :n]
+    base_r, base_c = np.nonzero(base_A)
+
+    if len(extra_rows) > 0:
+        norm_c = np.where(extra_cols < 0, n, extra_cols)
+        mat_mask = norm_c < n
+        all_r = np.concatenate([base_r, extra_rows[mat_mask].astype(np.int64)])
+        all_c = np.concatenate([base_c, norm_c[mat_mask].astype(np.int64)])
+    else:
+        all_r = base_r.astype(np.int64)
+        all_c = base_c.astype(np.int64)
+
+    # Deduplicate (row, col) and sort into canonical CSC order (column-major, row-sorted)
+    keys = all_c * n + all_r
+    uniq_keys = np.unique(keys)
+    csc_cols = (uniq_keys // n).astype(np.int32)
+    csc_rows = (uniq_keys % n).astype(np.int32)
+    nnz_A = len(csc_rows)
+
+    csc_indices = csc_rows
+    counts = np.bincount(csc_cols, minlength=n)
+    csc_indptr = np.empty(n + 1, dtype=np.int32)
+    csc_indptr[0] = 0
+    np.cumsum(counts, out=csc_indptr[1:])
+
+    base_aug = np.empty(nnz_A + n, dtype=np.complex128)
+    base_aug[:nnz_A] = base_A[csc_rows, csc_cols]
+    base_aug[nnz_A:] = base_matrix[:, n]
+
+    rc_to_pos = dict(zip(zip(csc_rows.tolist(), csc_cols.tolist()), range(nnz_A)))
+
+    return base_aug, csc_rows, csc_cols, csc_indices, csc_indptr, rc_to_pos, nnz_A
+
+
+def _map_rc_to_flat_pos(rows: np.ndarray, cols: np.ndarray, rc_to_pos: dict, nnz_A: int, n: int) -> np.ndarray:
+    norm_c = np.where(cols < 0, n, cols)
+    out = np.empty(len(rows), dtype=np.int32)
+    for i in range(len(rows)):
+        r = int(rows[i])
+        c = int(norm_c[i])
+        out[i] = (nnz_A + r) if c == n else rc_to_pos[(r, c)]
+    return out
+
+
+def _group_instructions_np(
+    inp_indices: np.ndarray,
+    func_indices: list[int],
+    out_row: np.ndarray,
+    out_col: np.ndarray,
+    flat_pos: np.ndarray,
+    sweep_param_set: set[int] | None = None,
+):
+    """Partition component update calls by (is_sweep, func_idx) into NumPy tuples."""
+    static_buckets: dict[int, list[int]] = defaultdict(list)
+    sweep_buckets: dict[int, list[int]] = defaultdict(list)
+
+    for k, f_idx in enumerate(func_indices):
+        f_idx_int = int(f_idx)
+        is_sweep = False
+        if sweep_param_set:
+            used = _FUNCTION_USED_ARGS[f_idx_int]
+            if used > 0:
+                row_vals = inp_indices[k, :used]
+                for v in row_vals:
+                    if int(v) in sweep_param_set:
+                        is_sweep = True
+                        break
+        if is_sweep:
+            sweep_buckets[f_idx_int].append(k)
+        else:
+            static_buckets[f_idx_int].append(k)
+
+    row_to_scatter: dict[int, list[int]] = defaultdict(list)
+    for m, r in enumerate(out_row):
+        row_to_scatter[int(r)].append(m)
+
+    def build_groups(buckets: dict[int, list[int]]):
+        groups = []
+        for f_idx_int, k_list in sorted(buckets.items()):
+            inp_sub = np.ascontiguousarray(inp_indices[k_list], dtype=np.int32)
+            local_out_rows = []
+            local_out_cols = []
+            local_flat_pos = []
+            for local_k, old_k in enumerate(k_list):
+                for m in row_to_scatter[old_k]:
+                    local_out_rows.append(local_k)
+                    local_out_cols.append(int(out_col[m]))
+                    local_flat_pos.append(int(flat_pos[m]))
+            if local_flat_pos:
+                n_out_cols = 3 if f_idx_int == 2 else (4 if f_idx_int == 17 else 1)
+                groups.append((
+                    f_idx_int,
+                    inp_sub,
+                    np.asarray(local_out_rows, dtype=np.int32),
+                    np.asarray(local_out_cols, dtype=np.int32),
+                    np.asarray(local_flat_pos, dtype=np.int32),
+                    n_out_cols,
+                ))
+        return tuple(groups)
+
+    return build_groups(static_buckets), build_groups(sweep_buckets)
+
+
+def build_sparse_simulation_arrays(
+    setup: Setup,
+    changing_pairs: list | None = None,
+    changing_values: jnp.ndarray | None = None,
+    optimization_pairs: list | None = None,
+):
+    """Build compact sparse CSC topology and minimal JAX arrays for `simulate`."""
+    from differometor._sparse_kernel import SparseTopology
+
+    instructions, matrices, metadata = build(setup, as_jax=False)
+    carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names = instructions
+    (
+        parameters_np,
+        carrier_matrix_np,
+        signal_matrix_np,
+        noise_matrix_np,
+        noise_selection_vectors_np,
+        qhd_parameter_indices_np,
+        qhd_placing_indices_np,
+        linked_indices_np,
+        linking_function_indices_np,
+        indices_to_link_np,
+    ) = matrices
+
+    param_name_to_idx = {name: i for i, name in enumerate(parameter_names)}
+    signal_components_set = set(signal_components)
+
+    if optimization_pairs is None:
+        optimization_pairs = []
+    if changing_pairs is None:
+        changing_pairs = []
+
+    optimized_parameter_indices = []
+    optimization_value_indices = []
+    carrier_components_seen = set()
+    carrier_arrays_raw = defaultdict(list)
+    carrier_changing_parameter_indices = []
+    signal_changing_parameter_indices = []
+
+    def append_info(instr_dict, target, comp, seen):
+        if comp in seen:
+            return
+        seen.add(comp)
+        inst = instr_dict[comp]
+        target["function_input_indices"].append(inst["function_input_indices"])
+        target["function_indices"].extend(inst["function_indices"])
+        target["output_column_indices"].append(inst["output_column_indices"])
+        target["output_row_indices"].append(np.full(len(inst["output_column_indices"]), len(seen) - 1, dtype=np.int32))
+        target["system_matrix_row_indices"].append(inst["system_matrix_row_indices"])
+        target["system_matrix_column_indices"].append(inst["system_matrix_column_indices"])
+
+    noise_components_seen = set()
+    noise_arrays_raw = defaultdict(list)
+    for comp in noise_instructions:
+        append_info(noise_instructions, noise_arrays_raw, comp, noise_components_seen)
+
+    signal_arrays_raw = defaultdict(list)
+    signal_component_number = 0
+    for inst in signal_instructions.values():
+        if "function_indices" not in inst:
+            continue
+        signal_arrays_raw["function_input_indices"].append(inst["function_input_indices"])
+        signal_arrays_raw["function_indices"].extend(inst["function_indices"])
+        signal_arrays_raw["output_column_indices"].append(inst["output_column_indices"])
+        if "output_row_indices" in inst:
+            signal_arrays_raw["output_row_indices"].append(inst["output_row_indices"].flatten() + signal_component_number)
+            signal_component_number += len(np.unique(inst["output_row_indices"]))
+        else:
+            signal_arrays_raw["output_row_indices"].append(
+                np.full(len(inst["output_column_indices"]), signal_component_number, dtype=np.int32)
+            )
+            signal_component_number += 1
+        signal_arrays_raw["system_matrix_row_indices"].append(inst["system_matrix_row_indices"])
+        signal_arrays_raw["system_matrix_column_indices"].append(inst["system_matrix_column_indices"])
+        if "carrier_indices" in inst:
+            signal_arrays_raw["carrier_indices"].append(inst["carrier_indices"])
+            signal_arrays_raw["carrier_row_indices"].append(inst["carrier_row_indices"])
+            signal_arrays_raw["carrier_column_indices"].append(inst["carrier_column_indices"])
+
+    for ix, opt_pair in enumerate(optimization_pairs):
+        if not isinstance(opt_pair[0], list):
+            opt_comp, opt_param = opt_pair
+            idx = param_name_to_idx.get(f"{opt_comp}_{opt_param}")
+            if idx is not None:
+                optimized_parameter_indices.append(idx)
+                optimization_value_indices.append(ix)
+        else:
+            for opt_comp, opt_param in opt_pair:
+                idx = param_name_to_idx.get(f"{opt_comp}_{opt_param}")
+                if idx is not None:
+                    optimized_parameter_indices.append(idx)
+                    optimization_value_indices.append(ix)
+        if opt_comp not in signal_components_set and opt_comp in carrier_instructions:
+            append_info(carrier_instructions, carrier_arrays_raw, opt_comp, carrier_components_seen)
+
+    for ch_comp, ch_param in changing_pairs:
+        idx = param_name_to_idx[f"{ch_comp}_{ch_param}"]
+        if ch_comp in signal_components_set:
+            signal_changing_parameter_indices.append(idx)
+        else:
+            carrier_changing_parameter_indices.append(idx)
+            append_info(carrier_instructions, carrier_arrays_raw, ch_comp, carrier_components_seen)
+
+    if len(carrier_changing_parameter_indices) != 0 and len(signal_changing_parameter_indices) != 0:
+        raise ValueError("This combination of changing component-parameter pairs is not supported yet.")
+
+    if changing_values is not None:
+        ch_vals = jnp.asarray(changing_values, dtype=jnp.float64)
+        if ch_vals.ndim == 1:
+            ch_vals = ch_vals.reshape(1, -1)
+    else:
+        ch_vals = None
+
+    if len(carrier_changing_parameter_indices) > 0:
+        carrier_changing_values = ch_vals
+        if carrier_changing_values.shape[0] != len(carrier_changing_parameter_indices):
+            raise ValueError(
+                "The changing_values array needs to have shape (number of changing parameters, number of values)."
+            )
+    else:
+        carrier_changing_values = jnp.zeros((0, 1), dtype=jnp.float64)
+
+    if len(signal_changing_parameter_indices) > 0:
+        signal_changing_values = ch_vals
+    else:
+        signal_changing_values = jnp.zeros((0, 1), dtype=jnp.float64)
+
+    sig_ch_set = set(signal_changing_parameter_indices)
+
+    # --- Carrier CSC & grouped updates ---
+    cn = carrier_matrix_np.shape[0]
+    if len(carrier_arrays_raw["function_input_indices"]) > 0:
+        c_inp = np.vstack(carrier_arrays_raw["function_input_indices"]).astype(np.int32)
+        c_out_r = np.concatenate(carrier_arrays_raw["output_row_indices"]).astype(np.int32)
+        c_out_c = np.concatenate(carrier_arrays_raw["output_column_indices"]).astype(np.int32)
+        c_mat_r = np.concatenate(carrier_arrays_raw["system_matrix_row_indices"]).astype(np.int32)
+        c_mat_c = np.concatenate(carrier_arrays_raw["system_matrix_column_indices"]).astype(np.int32)
+    else:
+        c_inp = np.zeros((0, 7), dtype=np.int32)
+        c_out_r = np.zeros((0,), dtype=np.int32)
+        c_out_c = np.zeros((0,), dtype=np.int32)
+        c_mat_r = np.zeros((0,), dtype=np.int32)
+        c_mat_c = np.zeros((0,), dtype=np.int32)
+
+    c_base_aug, c_rows, c_cols, c_indices, c_indptr, c_rc_to_pos, c_nnz = _pack_sparse_csc(
+        carrier_matrix_np, c_mat_r, c_mat_c
+    )
+    if len(c_mat_r) > 0:
+        c_flat_pos = _map_rc_to_flat_pos(c_mat_r, c_mat_c, c_rc_to_pos, c_nnz, cn)
+        carrier_groups, _ = _group_instructions_np(
+            c_inp, carrier_arrays_raw["function_indices"], c_out_r, c_out_c, c_flat_pos, sweep_param_set=None
+        )
+    else:
+        carrier_groups = ()
+
+    # --- Signal CSC & grouped updates ---
+    sn = signal_matrix_np.shape[0]
+    if len(signal_arrays_raw["function_input_indices"]) > 0:
+        s_inp = np.vstack(signal_arrays_raw["function_input_indices"]).astype(np.int32)
+        s_out_r = np.concatenate(signal_arrays_raw["output_row_indices"]).astype(np.int32)
+        s_out_c = np.concatenate(signal_arrays_raw["output_column_indices"]).astype(np.int32)
+        s_mat_r = np.concatenate(signal_arrays_raw["system_matrix_row_indices"]).astype(np.int32)
+        s_mat_c = np.concatenate(signal_arrays_raw["system_matrix_column_indices"]).astype(np.int32)
+    else:
+        s_inp = np.zeros((0, 7), dtype=np.int32)
+        s_out_r = np.zeros((0,), dtype=np.int32)
+        s_out_c = np.zeros((0,), dtype=np.int32)
+        s_mat_r = np.zeros((0,), dtype=np.int32)
+        s_mat_c = np.zeros((0,), dtype=np.int32)
+
+    if "carrier_indices" in signal_arrays_raw:
+        s_car_idx = np.concatenate(signal_arrays_raw["carrier_indices"]).astype(np.int32)
+        s_car_r = np.concatenate(signal_arrays_raw["carrier_row_indices"]).astype(np.int32)
+        s_car_c = np.concatenate(signal_arrays_raw["carrier_column_indices"]).astype(np.int32)
+        extra_s_r = np.concatenate([s_mat_r, s_car_r]) if len(s_mat_r) > 0 else s_car_r
+        extra_s_c = np.concatenate([s_mat_c, s_car_c]) if len(s_mat_c) > 0 else s_car_c
+    else:
+        s_car_idx = np.zeros((0,), dtype=np.int32)
+        s_car_r = np.zeros((0,), dtype=np.int32)
+        s_car_c = np.zeros((0,), dtype=np.int32)
+        extra_s_r = s_mat_r
+        extra_s_c = s_mat_c
+
+    s_base_aug, s_rows, s_cols, s_indices, s_indptr, s_rc_to_pos, s_nnz = _pack_sparse_csc(
+        signal_matrix_np, extra_s_r, extra_s_c
+    )
+    if len(s_mat_r) > 0:
+        s_flat_pos = _map_rc_to_flat_pos(s_mat_r, s_mat_c, s_rc_to_pos, s_nnz, sn)
+        signal_groups_static, signal_groups_sweep = _group_instructions_np(
+            s_inp, signal_arrays_raw["function_indices"], s_out_r, s_out_c, s_flat_pos, sweep_param_set=sig_ch_set
+        )
+    else:
+        signal_groups_static, signal_groups_sweep = (), ()
+
+    if len(s_car_idx) > 0:
+        s_car_flat_pos = _map_rc_to_flat_pos(s_car_r, s_car_c, s_rc_to_pos, s_nnz, sn)
+    else:
+        s_car_flat_pos = np.zeros((0,), dtype=np.int32)
+
+    conj_mask = np.zeros(s_nnz + sn, dtype=bool)
+    conj_mask[:s_nnz] = (
+        ((s_rows >= cn) & (s_rows < 2 * cn) & (s_cols >= cn) & (s_cols < 2 * cn))
+        | ((s_rows >= 2 * cn) & (s_cols < cn))
+        | ((s_rows >= cn) & (s_rows < 2 * cn) & (s_cols >= 2 * cn))
+    )
+    conj_mask[s_nnz + cn : s_nnz + 2 * cn] = True
+
+    # --- Noise sparse COO & grouped updates ---
+    if len(noise_arrays_raw["function_input_indices"]) > 0:
+        n_inp = np.vstack(noise_arrays_raw["function_input_indices"]).astype(np.int32)
+        n_out_r = np.concatenate(noise_arrays_raw["output_row_indices"]).astype(np.int32)
+        n_out_c = np.concatenate(noise_arrays_raw["output_column_indices"]).astype(np.int32)
+        n_mat_r = np.concatenate(noise_arrays_raw["system_matrix_row_indices"]).astype(np.int32)
+        n_mat_c = np.concatenate(noise_arrays_raw["system_matrix_column_indices"]).astype(np.int32)
+
+        n_rc_to_pos = {}
+        n_rows_list = []
+        n_cols_list = []
+        n_flat_pos = np.empty(len(n_mat_r), dtype=np.int32)
+        for i in range(len(n_mat_r)):
+            key = (int(n_mat_r[i]), int(n_mat_c[i]))
+            pos = n_rc_to_pos.get(key)
+            if pos is None:
+                pos = len(n_rows_list)
+                n_rc_to_pos[key] = pos
+                n_rows_list.append(key[0])
+                n_cols_list.append(key[1])
+            n_flat_pos[i] = pos
+        noise_rows = np.asarray(n_rows_list, dtype=np.int32)
+        noise_cols = np.asarray(n_cols_list, dtype=np.int32)
+        noise_base_vals = (
+            noise_matrix_np[noise_rows, noise_cols].astype(np.complex128)
+            if noise_matrix_np is not None
+            else np.zeros(len(noise_rows), dtype=np.complex128)
+        )
+        noise_groups_static, noise_groups_sweep = _group_instructions_np(
+            n_inp, noise_arrays_raw["function_indices"], n_out_r, n_out_c, n_flat_pos, sweep_param_set=sig_ch_set
+        )
+    else:
+        noise_rows = np.zeros((0,), dtype=np.int32)
+        noise_cols = np.zeros((0,), dtype=np.int32)
+        noise_base_vals = np.zeros((0,), dtype=np.complex128)
+        noise_groups_static, noise_groups_sweep = (), ()
+
+    # --- Linked parameter groups (empty dict when unused) ---
+    linked_groups = {}
+    if len(linked_indices_np) > 0:
+        tmp_links: dict[int, tuple[list[int], list[int]]] = {}
+        for src, f_i, dst in zip(linked_indices_np, linking_function_indices_np, indices_to_link_np):
+            fi = int(f_i)
+            if fi not in tmp_links:
+                tmp_links[fi] = ([], [])
+            tmp_links[fi][0].append(int(src))
+            tmp_links[fi][1].append(int(dst))
+        for fi, (srcs, dsts) in sorted(tmp_links.items()):
+            linked_groups[fi] = (jnp.asarray(srcs, dtype=jnp.int32), jnp.asarray(dsts, dtype=jnp.int32))
+
+    opt_param_idx_np = np.asarray(optimized_parameter_indices, dtype=np.int32)
+    opt_val_idx_np = np.asarray(optimization_value_indices, dtype=np.int32)
+
+    topology = SparseTopology(
+        cn=cn,
+        sn=sn,
+        nnz_c=c_nnz,
+        nnz_s=s_nnz,
+        nnz_n=len(noise_rows),
+        num_detectors=noise_selection_vectors_np.shape[0],
+        opt_param_idx=opt_param_idx_np,
+        opt_val_idx=opt_val_idx_np,
+        car_ch_idx=np.asarray(carrier_changing_parameter_indices, dtype=np.int32),
+        sig_ch_idx=np.asarray(signal_changing_parameter_indices, dtype=np.int32),
+        qhd_param_idx=qhd_parameter_indices_np,
+        qhd_placing_idx=qhd_placing_indices_np,
+        carrier_base_aug=c_base_aug,
+        carrier_csc_rows=c_rows.astype(np.int64),
+        carrier_csc_cols=c_cols.astype(np.int64),
+        carrier_csc_indices=c_indices,
+        carrier_csc_indptr=c_indptr,
+        carrier_groups=carrier_groups,
+        signal_base_aug=s_base_aug,
+        signal_csc_rows=s_rows.astype(np.int64),
+        signal_csc_cols=s_cols.astype(np.int64),
+        signal_csc_indices=s_indices,
+        signal_csc_indptr=s_indptr,
+        signal_groups_static=signal_groups_static,
+        signal_groups_sweep=signal_groups_sweep,
+        signal_carrier_indices=s_car_idx,
+        signal_carrier_flat_pos=s_car_flat_pos,
+        signal_conj_mask=conj_mask,
+        noise_base_vals=noise_base_vals,
+        noise_rows=noise_rows,
+        noise_cols=noise_cols,
+        noise_groups_static=noise_groups_static,
+        noise_groups_sweep=noise_groups_sweep,
+    )
+
+    if len(optimized_parameter_indices) == 0:
+        opt_params = jnp.zeros((0,), dtype=jnp.float64)
+    else:
+        opt_params = None
+
+    simulation_arrays = {
+        "optimized_parameters": opt_params,
+        "parameters": jnp.asarray(parameters_np.real, dtype=jnp.float64),
+        "carrier_changing_values": carrier_changing_values,
+        "signal_changing_values": signal_changing_values,
+        "noise_selection_vectors": jnp.asarray(noise_selection_vectors_np, dtype=jnp.complex128),
+        "linked_groups": linked_groups,
+        "topology": topology,
+    }
+
+    return simulation_arrays, metadata
+

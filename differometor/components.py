@@ -932,6 +932,50 @@ def surface(parameters: jnp.ndarray) -> jnp.ndarray:
     return standardize_output([reflectivity_left_entry, transmissivity_entry, reflectivity_right_entry])
 
 
+def _phase_shift_np(tuning: float, frequency: float, refractive_index: float) -> float:
+    return 2.0 * np.radians(tuning) * refractive_index * (1.0 + frequency / F0)
+
+
+def _reflectivity_left_np(
+    reflectivity: float,
+    tuning: float,
+    frequency: float,
+    refractive_index_left: float,
+    alpha: float = 0.0,
+) -> complex:
+    return -np.sqrt(reflectivity) * np.exp(
+        1j * _phase_shift_np(tuning, frequency, refractive_index_left) * np.cos(np.radians(alpha))
+    )
+
+
+def _reflectivity_right_np(
+    reflectivity: float,
+    tuning: float,
+    frequency: float,
+    refractive_index_left: float,
+    refractive_index_right: float = 1.0,
+    alpha: float = 0.0,
+) -> complex:
+    cos_beta = np.cos(np.arcsin(refractive_index_right / refractive_index_left * np.sin(np.radians(alpha))))
+    return -np.sqrt(reflectivity) * np.exp(
+        -1j * _phase_shift_np(tuning, frequency, refractive_index_right) * cos_beta
+    )
+
+
+def _transmissivity_np(
+    transmissivity_val: float,
+    tuning: float,
+    frequency: float,
+    refractive_index_left: float,
+    refractive_index_right: float,
+    alpha: float = 0.0,
+) -> complex:
+    left_term = _phase_shift_np(tuning, frequency, refractive_index_left) * np.cos(np.radians(alpha))
+    cos_beta = np.cos(np.arcsin(refractive_index_left / refractive_index_right * np.sin(np.radians(alpha))))
+    right_term = _phase_shift_np(tuning, frequency, refractive_index_right) * cos_beta
+    return -np.sqrt(transmissivity_val) * np.exp(1j * (np.pi / 2.0 + 0.5 * (left_term - right_term)))
+
+
 def mirror_matrix(
     loss: float = 0.0,
     reflectivity: float = 0.5,
@@ -973,13 +1017,13 @@ def mirror_matrix(
     absolute_reflectivity = (1 - loss) * reflectivity
     absolute_transmissivity = (1 - loss) * (1 - reflectivity)
 
-    reflectivity_left_to_left = reflectivity_left(
+    reflectivity_left_to_left = _reflectivity_left_np(
         absolute_reflectivity, tuning, frequency, refractive_index_left
     )
-    transmissivity_entry = transmissivity(
+    transmissivity_entry = _transmissivity_np(
         absolute_transmissivity, tuning, frequency, refractive_index_left, refractive_index_right
     )
-    reflectivity_right_to_right = reflectivity_right(
+    reflectivity_right_to_right = _reflectivity_right_np(
         absolute_reflectivity, tuning, frequency, refractive_index_left, refractive_index_right
     )
 
@@ -989,7 +1033,8 @@ def mirror_matrix(
             [reflectivity_left_to_left, 1, transmissivity_entry, 0],  # left output
             [0, 0, 1, 0],  # right input
             [transmissivity_entry, 0, reflectivity_right_to_right, 1],  # right output
-        ]
+        ],
+        dtype=np.complex128,
     )
 
 
@@ -1035,10 +1080,10 @@ def beamsplitter_matrix(
     absolute_reflectivity = (1 - loss) * reflectivity
     absolute_transmissivity = (1 - loss) * (1 - reflectivity)
 
-    reflectivity_left_entry = reflectivity_left(
+    reflectivity_left_entry = _reflectivity_left_np(
         absolute_reflectivity, tuning, frequency, refractive_index_left, alpha
     )
-    transmissivity_entry = transmissivity(
+    transmissivity_entry = _transmissivity_np(
         absolute_transmissivity,
         tuning,
         frequency,
@@ -1046,7 +1091,7 @@ def beamsplitter_matrix(
         refractive_index_right,
         alpha,
     )
-    reflectivity_right_entry = reflectivity_right(
+    reflectivity_right_entry = _reflectivity_right_np(
         absolute_reflectivity,
         tuning,
         frequency,
@@ -1065,7 +1110,8 @@ def beamsplitter_matrix(
             [transmissivity_entry, 0, 0, 0, 0, 1, reflectivity_right_entry, 0],  # right output
             [0, 0, 0, 0, 0, 0, 1, 0],  # bottom input
             [0, 0, transmissivity_entry, 0, reflectivity_right_entry, 0, 0, 1],  # bottom output
-        ]
+        ],
+        dtype=np.complex128,
     )
 
 
@@ -1385,3 +1431,146 @@ FUNCTIONS = [
 The order is important if the caller uses integer indices to reference a
 component model.
 """
+
+
+# -----------------------------------------------------------------------------
+# Vectorized batch component functions (aligned with FUNCTIONS indices 0..18)
+# Each takes `p` of shape (..., 7) and returns complex128 array of shape (..., C).
+# -----------------------------------------------------------------------------
+
+def _batch_force_calculation_right(p: jnp.ndarray) -> jnp.ndarray:
+    val = incidence_angle_right(p[..., 0], p[..., 1], p[..., 2]) / (C_LIGHT * X_SCALE)
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_laser(p: jnp.ndarray) -> jnp.ndarray:
+    val = jnp.sqrt(2 * p[..., 0] / EPSILON_0C) * jnp.exp(1j * jnp.radians(p[..., 1]))
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_surface(p: jnp.ndarray) -> jnp.ndarray:
+    abs_r = (1 - p[..., 0]) * p[..., 1]
+    abs_t = (1 - p[..., 0]) * (1 - p[..., 1])
+    tuning, freq, n_l, n_r, alpha = p[..., 2], p[..., 3], p[..., 4], p[..., 5], p[..., 6]
+    r_l = reflectivity_left(abs_r, tuning, freq, n_l, alpha)
+    t_val = transmissivity(abs_t, tuning, freq, n_l, n_r, alpha)
+    r_r = reflectivity_right(abs_r, tuning, freq, n_l, n_r, alpha)
+    return jnp.stack([r_l, t_val, r_r], axis=-1).astype(jnp.complex128)
+
+
+def _batch_space(p: jnp.ndarray) -> jnp.ndarray:
+    phi = -jnp.exp(-1j * 2 * jnp.pi * p[..., 0] * p[..., 1] * p[..., 2] / C_LIGHT)
+    return phi.astype(jnp.complex128)[..., None]
+
+
+def _batch_space_lower(p: jnp.ndarray) -> jnp.ndarray:
+    phi = -jnp.exp(1j * 2 * jnp.pi * p[..., 0] * p[..., 1] * p[..., 2] / C_LIGHT)
+    return phi.astype(jnp.complex128)[..., None]
+
+
+def _batch_space_modulation(p: jnp.ndarray) -> jnp.ndarray:
+    w_g = 2 * jnp.pi * p[..., 0]
+    w_0 = 2 * jnp.pi * F0
+    arg = w_g * p[..., 1] * p[..., 2] / (2 * C_LIGHT)
+    m_g = -0.5 * w_0 / w_g * jnp.sin(arg)
+    z = 1j * m_g * jnp.exp(-1j * arg)
+    return z.astype(jnp.complex128)[..., None]
+
+
+def _batch_space_modulation_lower(p: jnp.ndarray) -> jnp.ndarray:
+    w_g = -2 * jnp.pi * p[..., 0]
+    w_0 = 2 * jnp.pi * F0
+    arg = w_g * p[..., 1] * p[..., 2] / (2 * C_LIGHT)
+    m_g = -0.5 * w_0 / w_g * jnp.sin(arg)
+    z = 1j * m_g * jnp.exp(-1j * arg)
+    return z.astype(jnp.complex128)[..., None]
+
+
+def _batch_signal_function(p: jnp.ndarray) -> jnp.ndarray:
+    val = p[..., 0] * jnp.exp(1j * jnp.radians(p[..., 1]))
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_dummy_function(p: jnp.ndarray) -> jnp.ndarray:
+    return jnp.ones(p.shape[:-1] + (1,), dtype=jnp.complex128)
+
+
+def _batch_vacuum_quantum_noise(p: jnp.ndarray) -> jnp.ndarray:
+    return jnp.full(p.shape[:-1] + (1,), UNIT_VACUUM / 2, dtype=jnp.complex128)
+
+
+def _batch_loss_quantum_noise(p: jnp.ndarray) -> jnp.ndarray:
+    return (p[..., 0] / 2).astype(jnp.complex128)[..., None]
+
+
+def _batch_laser_amplitude_modulation(p: jnp.ndarray) -> jnp.ndarray:
+    return jnp.full(p.shape[:-1] + (1,), EPSILON_0C * 0.5, dtype=jnp.complex128)
+
+
+def _batch_laser_frequency_modulation(p: jnp.ndarray) -> jnp.ndarray:
+    return (EPSILON_0C * 0.5 / p[..., 0]).astype(jnp.complex128)[..., None]
+
+
+def _batch_laser_frequency_modulation_lower(p: jnp.ndarray) -> jnp.ndarray:
+    return (EPSILON_0C * 0.5 / (-p[..., 0])).astype(jnp.complex128)[..., None]
+
+
+def _batch_susceptibility(p: jnp.ndarray) -> jnp.ndarray:
+    val = 1.0 / (p[..., 1] * (2 * jnp.pi * p[..., 0]) ** 2)
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_force_calculation_left(p: jnp.ndarray) -> jnp.ndarray:
+    val = -incidence_angle_left(p[..., 0]) / (C_LIGHT * X_SCALE)
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_corrected_optomechanical_phase_left(p: jnp.ndarray) -> jnp.ndarray:
+    abs_r = (1 - p[..., 3]) * p[..., 2]
+    tc = jnp.exp(1j * jnp.radians(p[..., 1]) * p[..., 0] / F0)
+    val = -(tc * optomechanical_phase_left(p[..., 5]) * reflectivity_left(abs_r, p[..., 1], p[..., 0], p[..., 4], p[..., 5]))
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_corrected_optomechanical_phase_right(p: jnp.ndarray) -> jnp.ndarray:
+    abs_r = (1 - p[..., 3]) * p[..., 2]
+    tc = jnp.exp(1j * jnp.radians(p[..., 1]) * p[..., 0] / F0)
+    val = (
+        jnp.conj(tc)
+        * optomechanical_phase_right(p[..., 6], p[..., 4], p[..., 5])
+        * reflectivity_right(abs_r, p[..., 1], p[..., 0], p[..., 4], p[..., 5], p[..., 6])
+    )
+    return val.astype(jnp.complex128)[..., None]
+
+
+def _batch_squeezer(p: jnp.ndarray) -> jnp.ndarray:
+    vacuum_unit = UNIT_VACUUM / 2
+    sq_param = p[..., 0] / (20 * jnp.log10(jnp.e))
+    phase = jnp.exp(1j * 2 * jnp.radians(p[..., 1]))
+    u_diag = vacuum_unit * jnp.cosh(2 * sq_param)
+    u_off = vacuum_unit * jnp.sinh(2 * sq_param) * phase
+    return jnp.stack([u_diag, u_off, jnp.conj(u_diag), jnp.conj(u_off)], axis=-1).astype(jnp.complex128)
+
+
+BATCH_FUNCTIONS = [
+    _batch_force_calculation_right,
+    _batch_laser,
+    _batch_surface,
+    _batch_space,
+    _batch_space_modulation,
+    _batch_signal_function,
+    _batch_dummy_function,
+    _batch_vacuum_quantum_noise,
+    _batch_loss_quantum_noise,
+    _batch_space_lower,
+    _batch_laser_amplitude_modulation,
+    _batch_laser_frequency_modulation,
+    _batch_susceptibility,
+    _batch_force_calculation_left,
+    _batch_corrected_optomechanical_phase_left,
+    _batch_corrected_optomechanical_phase_right,
+    _batch_space_modulation_lower,
+    _batch_squeezer,
+    _batch_laser_frequency_modulation_lower,
+]
+
