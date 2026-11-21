@@ -141,44 +141,59 @@ class _ForwardTape:
 _forward_tape = _ForwardTape()
 
 
-def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters, *, save_residuals):
-    b_car = car_ch_vals.shape[1] if topo.car_ch_idx.size > 0 else 1
-    b_sig = sig_ch_vals.shape[1] if topo.sig_ch_idx.size > 0 else b_car
-    D = topo.num_detectors
+class _HostCallback:
+    """Base for the host callbacks: equal for the same topology object and flags.
 
-    specs = (
-        jax.ShapeDtypeStruct((topo.cn, b_car), jnp.complex128),
-        jax.ShapeDtypeStruct((topo.sn, b_sig), jnp.complex128),
-        jax.ShapeDtypeStruct((D, b_sig), jnp.float64),
-    )
+    `jax.pure_callback` keys its compiled executables on the callback object. A new closure per call
+    made every eager (non-jit) call miss that cache, compile again and keep the entry (~1-3 MB each,
+    up to 4096 entries). Equal callback objects let repeated calls reuse it.
+    """
 
-    def _call(opt, base, car_sweep, sig_sweep, vectors):
+    __slots__ = ("topo", "bind_parameters")
+
+    def __init__(self, topo, bind_parameters):
+        self.topo = topo
+        self.bind_parameters = bind_parameters
+
+    def _key(self):
+        return (type(self), self.bind_parameters)
+
+    def __eq__(self, other):
+        return isinstance(other, _HostCallback) and other.topo is self.topo and other._key() == self._key()
+
+    def __hash__(self):
+        return hash((id(self.topo), *self._key()))
+
+
+class _ForwardCallback(_HostCallback):
+    __slots__ = ("save_residuals",)
+
+    def __init__(self, topo, bind_parameters, save_residuals):
+        super().__init__(topo, bind_parameters)
+        self.save_residuals = save_residuals
+
+    def _key(self):
+        return (type(self), self.bind_parameters, self.save_residuals)
+
+    def __call__(self, opt, base, car_sweep, sig_sweep, vectors):
+        topo, bind_parameters = self.topo, self.bind_parameters
         inputs = tuple(np.asarray(x) for x in (opt, base, car_sweep, sig_sweep, vectors))
         bound = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
         if topo.host_linked_groups:
             bound = apply_host_links_fwd(bound, topo)
         carrier, signal, noise, *residuals = sparse_simulate_fwd_host(
-            topo, bound, *inputs[2:], save_factors=save_residuals
+            topo, bound, *inputs[2:], save_factors=self.save_residuals
         )
-        if save_residuals:
+        if self.save_residuals:
             _forward_tape.save(topo, bind_parameters, inputs, residuals)
         return carrier.T, signal.T, noise
 
-    return jax.pure_callback(
-        _call, specs, optimized, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential"
-    )
 
+class _BackwardCallback(_HostCallback):
+    __slots__ = ()
 
-def _sparse_simulate_core_fwd(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters):
-    inputs = (optimized, p_base, car_ch_vals, sig_ch_vals, nsv)
-    results = _sparse_forward(*inputs, topo, bind_parameters, save_residuals=True)
-    return results, (*inputs, *results)
-
-
-def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
-    specs = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in res[:5])
-
-    def _call_bwd(opt, base, car_sweep, sig_sweep, vectors, carrier, signal, noise, g_carrier, g_signal, g_noise):
+    def __call__(self, opt, base, car_sweep, sig_sweep, vectors, carrier, signal, noise, g_carrier, g_signal, g_noise):
+        topo, bind_parameters = self.topo, self.bind_parameters
         inputs = tuple(np.asarray(x) for x in (opt, base, car_sweep, sig_sweep, vectors))
         bound_pre = _insert_optimized_parameters(inputs[1], inputs[0], topo, bind_parameters)
         bound = apply_host_links_fwd(bound_pre, topo) if topo.host_linked_groups else bound_pre
@@ -192,16 +207,42 @@ def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
         )
         if topo.host_linked_groups:
             apply_host_links_bwd(g_base, bound_pre, topo)
-        g_opt = np.zeros(opt.shape, dtype=g_base.dtype)
+        g_opt = np.zeros(inputs[0].shape, dtype=g_base.dtype)
         if bind_parameters:
             indices = topo.opt_param_idx
             np.add.at(g_opt, topo.opt_val_idx, g_base[0, indices])
             g_base[0, indices] = 0
         gradients = (g_opt, g_base, *rest)
-        return tuple(gradient.astype(spec.dtype, copy=False) for gradient, spec in zip(gradients, specs))
+        # Cotangents take the primal dtypes (the callback receives the primals in their declared dtypes).
+        return tuple(gradient.astype(x.dtype, copy=False) for gradient, x in zip(gradients, inputs))
 
+
+def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters, *, save_residuals):
+    b_car = car_ch_vals.shape[1] if topo.car_ch_idx.size > 0 else 1
+    b_sig = sig_ch_vals.shape[1] if topo.sig_ch_idx.size > 0 else b_car
+    D = topo.num_detectors
+
+    specs = (
+        jax.ShapeDtypeStruct((topo.cn, b_car), jnp.complex128),
+        jax.ShapeDtypeStruct((topo.sn, b_sig), jnp.complex128),
+        jax.ShapeDtypeStruct((D, b_sig), jnp.float64),
+    )
     return jax.pure_callback(
-        _call_bwd,
+        _ForwardCallback(topo, bind_parameters, save_residuals),
+        specs, optimized, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential",
+    )
+
+
+def _sparse_simulate_core_fwd(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters):
+    inputs = (optimized, p_base, car_ch_vals, sig_ch_vals, nsv)
+    results = _sparse_forward(*inputs, topo, bind_parameters, save_residuals=True)
+    return results, (*inputs, *results)
+
+
+def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
+    specs = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in res[:5])
+    return jax.pure_callback(
+        _BackwardCallback(topo, bind_parameters),
         specs,
         *res,
         *g,
