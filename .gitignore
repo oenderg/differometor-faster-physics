@@ -10,3 +10,6 @@ benchmark*.pdf
 benchmark*.svg
 *.npz
 examples/results/
+
+# team tooling
+.bench/
