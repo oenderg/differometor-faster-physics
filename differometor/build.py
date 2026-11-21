@@ -650,7 +650,7 @@ def build(setup: Setup, as_jax: bool = True):
 
     # Carrier matrix: identity on the left block, with a separate right-hand-side column.
     carrier_matrix = np.zeros((system_size, system_size + 1), dtype=complex)
-    carrier_matrix[:, :system_size] = np.eye(system_size, dtype=complex)
+    np.fill_diagonal(carrier_matrix, 1)
 
     # Ensure signal_size is at least 1 to avoid conditional logic later.
     if signal_size == 0:
@@ -658,7 +658,7 @@ def build(setup: Setup, as_jax: bool = True):
 
     # Signal matrix includes two carrier-sized blocks plus appended signal block, plus a right-hand-side column.
     signal_matrix = np.zeros((system_size * 2 + signal_size, system_size * 2 + signal_size + 1), dtype=complex)
-    signal_matrix[:, : system_size * 2 + signal_size] = np.eye(system_size * 2 + signal_size, dtype=complex)
+    np.fill_diagonal(signal_matrix, 1)
 
     # Noise matrix has the same shape as the signal matrix without the right-hand side.
     noise_matrix = np.zeros(signal_matrix[:, :-1].shape) if as_jax else None
@@ -1866,7 +1866,7 @@ _FUNCTION_USED_ARGS = (
 def _pack_sparse_csc(base_matrix: np.ndarray, extra_rows: np.ndarray, extra_cols: np.ndarray):
     """Build static CSC structure for an augmented (N, N + 1) matrix in pure NumPy.
 
-    Returns (base_aug, csc_rows, csc_cols, csc_indices, csc_indptr, rc_to_pos, nnz_A).
+    Returns the base values, CSC metadata and sorted column-major keys.
     RHS column entries (col == N or col == -1) map to flat positions [nnz_A, nnz_A + N).
     """
     n = base_matrix.shape[0]
@@ -1899,19 +1899,13 @@ def _pack_sparse_csc(base_matrix: np.ndarray, extra_rows: np.ndarray, extra_cols
     base_aug[:nnz_A] = base_A[csc_rows, csc_cols]
     base_aug[nnz_A:] = base_matrix[:, n]
 
-    rc_to_pos = dict(zip(zip(csc_rows.tolist(), csc_cols.tolist()), range(nnz_A)))
-
-    return base_aug, csc_rows, csc_cols, csc_indices, csc_indptr, rc_to_pos, nnz_A
+    return base_aug, csc_rows, csc_cols, csc_indices, csc_indptr, uniq_keys, nnz_A
 
 
-def _map_rc_to_flat_pos(rows: np.ndarray, cols: np.ndarray, rc_to_pos: dict, nnz_A: int, n: int) -> np.ndarray:
-    norm_c = np.where(cols < 0, n, cols)
-    out = np.empty(len(rows), dtype=np.int32)
-    for i in range(len(rows)):
-        r = int(rows[i])
-        c = int(norm_c[i])
-        out[i] = (nnz_A + r) if c == n else rc_to_pos[(r, c)]
-    return out
+def _map_rc_to_flat_pos(rows: np.ndarray, cols: np.ndarray, csc_keys: np.ndarray, nnz_A: int, n: int) -> np.ndarray:
+    rhs = (cols < 0) | (cols == n)
+    keys = cols.astype(np.int64) * n + rows
+    return np.where(rhs, nnz_A + rows, np.searchsorted(csc_keys, keys)).astype(np.int32)
 
 
 def _group_instructions_np(
@@ -2080,12 +2074,11 @@ def build_sparse_simulation_arrays(
         raise ValueError("This combination of changing component-parameter pairs is not supported yet.")
 
     if changing_values is not None:
-        ch_vals = jnp.asarray(changing_values, dtype=jnp.float64)
-        if ch_vals.ndim == 1:
-            ch_vals = ch_vals.reshape(1, -1)
+        ch_vals = jnp.asarray(np.atleast_2d(changing_values), dtype=jnp.float64)
     else:
         ch_vals = None
 
+    empty_sweep = jnp.asarray(np.empty((0, 1), dtype=np.float64))
     if len(carrier_changing_parameter_indices) > 0:
         carrier_changing_values = ch_vals
         if carrier_changing_values.shape[0] != len(carrier_changing_parameter_indices):
@@ -2093,12 +2086,12 @@ def build_sparse_simulation_arrays(
                 "The changing_values array needs to have shape (number of changing parameters, number of values)."
             )
     else:
-        carrier_changing_values = jnp.zeros((0, 1), dtype=jnp.float64)
+        carrier_changing_values = empty_sweep
 
     if len(signal_changing_parameter_indices) > 0:
         signal_changing_values = ch_vals
     else:
-        signal_changing_values = jnp.zeros((0, 1), dtype=jnp.float64)
+        signal_changing_values = empty_sweep
 
     sig_ch_set = set(signal_changing_parameter_indices)
 
@@ -2117,11 +2110,11 @@ def build_sparse_simulation_arrays(
         c_mat_r = np.zeros((0,), dtype=np.int32)
         c_mat_c = np.zeros((0,), dtype=np.int32)
 
-    c_base_aug, c_rows, c_cols, c_indices, c_indptr, c_rc_to_pos, c_nnz = _pack_sparse_csc(
+    c_base_aug, c_rows, c_cols, c_indices, c_indptr, c_keys, c_nnz = _pack_sparse_csc(
         carrier_matrix_np, c_mat_r, c_mat_c
     )
     if len(c_mat_r) > 0:
-        c_flat_pos = _map_rc_to_flat_pos(c_mat_r, c_mat_c, c_rc_to_pos, c_nnz, cn)
+        c_flat_pos = _map_rc_to_flat_pos(c_mat_r, c_mat_c, c_keys, c_nnz, cn)
         carrier_groups, _ = _group_instructions_np(
             c_inp, carrier_arrays_raw["function_indices"], c_out_r, c_out_c, c_flat_pos, sweep_param_set=None
         )
@@ -2156,11 +2149,11 @@ def build_sparse_simulation_arrays(
         extra_s_r = s_mat_r
         extra_s_c = s_mat_c
 
-    s_base_aug, s_rows, s_cols, s_indices, s_indptr, s_rc_to_pos, s_nnz = _pack_sparse_csc(
+    s_base_aug, s_rows, s_cols, s_indices, s_indptr, s_keys, s_nnz = _pack_sparse_csc(
         signal_matrix_np, extra_s_r, extra_s_c
     )
     if len(s_mat_r) > 0:
-        s_flat_pos = _map_rc_to_flat_pos(s_mat_r, s_mat_c, s_rc_to_pos, s_nnz, sn)
+        s_flat_pos = _map_rc_to_flat_pos(s_mat_r, s_mat_c, s_keys, s_nnz, sn)
         signal_groups_static, signal_groups_sweep = _group_instructions_np(
             s_inp, signal_arrays_raw["function_indices"], s_out_r, s_out_c, s_flat_pos, sweep_param_set=sig_ch_set
         )
@@ -2168,7 +2161,7 @@ def build_sparse_simulation_arrays(
         signal_groups_static, signal_groups_sweep = (), ()
 
     if len(s_car_idx) > 0:
-        s_car_flat_pos = _map_rc_to_flat_pos(s_car_r, s_car_c, s_rc_to_pos, s_nnz, sn)
+        s_car_flat_pos = _map_rc_to_flat_pos(s_car_r, s_car_c, s_keys, s_nnz, sn)
     else:
         s_car_flat_pos = np.zeros((0,), dtype=np.int32)
 
@@ -2188,21 +2181,13 @@ def build_sparse_simulation_arrays(
         n_mat_r = np.concatenate(noise_arrays_raw["system_matrix_row_indices"]).astype(np.int32)
         n_mat_c = np.concatenate(noise_arrays_raw["system_matrix_column_indices"]).astype(np.int32)
 
-        n_rc_to_pos = {}
-        n_rows_list = []
-        n_cols_list = []
-        n_flat_pos = np.empty(len(n_mat_r), dtype=np.int32)
-        for i in range(len(n_mat_r)):
-            key = (int(n_mat_r[i]), int(n_mat_c[i]))
-            pos = n_rc_to_pos.get(key)
-            if pos is None:
-                pos = len(n_rows_list)
-                n_rc_to_pos[key] = pos
-                n_rows_list.append(key[0])
-                n_cols_list.append(key[1])
-            n_flat_pos[i] = pos
-        noise_rows = np.asarray(n_rows_list, dtype=np.int32)
-        noise_cols = np.asarray(n_cols_list, dtype=np.int32)
+        _, first, inverse = np.unique(
+            n_mat_r.astype(np.int64) * sn + n_mat_c, return_index=True, return_inverse=True
+        )
+        in_write_order = np.argsort(first)
+        noise_rows = n_mat_r[first[in_write_order]]
+        noise_cols = n_mat_c[first[in_write_order]]
+        n_flat_pos = np.argsort(in_write_order)[inverse].astype(np.int32)
         noise_base_vals = (
             noise_matrix_np[noise_rows, noise_cols].astype(np.complex128)
             if noise_matrix_np is not None
@@ -2232,6 +2217,10 @@ def build_sparse_simulation_arrays(
 
     opt_param_idx_np = np.asarray(optimized_parameter_indices, dtype=np.int32)
     opt_val_idx_np = np.asarray(optimization_value_indices, dtype=np.int32)
+    _, last_reversed = np.unique(opt_param_idx_np[::-1], return_index=True)
+    opt_write_rows = np.sort(opt_param_idx_np.size - 1 - last_reversed)
+    opt_param_idx_np = opt_param_idx_np[opt_write_rows]
+    opt_val_idx_np = opt_val_idx_np[opt_write_rows]
 
     topology = SparseTopology(
         cn=cn,
@@ -2270,7 +2259,7 @@ def build_sparse_simulation_arrays(
     )
 
     if len(optimized_parameter_indices) == 0:
-        opt_params = jnp.zeros((0,), dtype=jnp.float64)
+        opt_params = jnp.asarray(np.empty(0, dtype=np.float64))
     else:
         opt_params = None
 

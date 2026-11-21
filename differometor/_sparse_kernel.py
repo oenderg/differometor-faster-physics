@@ -13,14 +13,9 @@ This module implements:
 from __future__ import annotations
 
 import numpy as np
-from scipy.sparse.linalg._dsolve import _superlu
+from scipy.sparse import csc_matrix
+from scipy.sparse.linalg import splu
 import jax
-
-_SUPERLU_OPTS = {"ColPerm": "COLAMD", "DiagPivotThresh": 1.0}
-
-
-def _noop_csc(*args):
-    return args
 
 from differometor.components import (
     C_LIGHT,
@@ -42,9 +37,42 @@ _SQ_K = 1.0 / (20.0 * np.log10(np.e))
 _NOISE_SCALE = 2.0 * UNIT_VACUUM * H_PLANCK * F0 * 0.25
 
 
+def _factorize(matrix, data):
+    """Return no factor for a singular optical system, matching the dense solve."""
+    matrix.data = data
+    try:
+        return splu(matrix, permc_spec="COLAMD", diag_pivot_thresh=1.0)
+    except RuntimeError as error:
+        if "singular" not in str(error).lower():
+            raise
+        return None
+
+
+def _csc_workspace(size, indices, indptr):
+    """Construct the CSC structure once per callback and replace its numeric values per row."""
+    data = np.empty(indices.size, dtype=np.complex128)
+    return csc_matrix((data, indices, indptr), shape=(size, size))
+
+
+def _solve_refined(matrix, factors, rhs, trans="N"):
+    """Correct the solve residual in float64 using the existing LU factors."""
+    solution = factors.solve(rhs, trans=trans)
+    if trans == "N":
+        residual = rhs - matrix @ solution
+    elif trans == "T":
+        residual = rhs - matrix.T @ solution
+    else:
+        residual = rhs - np.conj(matrix.T @ np.conj(solution))
+    return solution + factors.solve(residual, trans=trans)
+
+
 # -----------------------------------------------------------------------------
 # Helper geometry / angle derivatives (real float64)
 # -----------------------------------------------------------------------------
+
+def _cos_beta(alpha_deg, n_l, n_r):
+    return np.cos(np.arcsin((n_l * (1.0 / n_r)) * np.sin(alpha_deg * _DEG)))
+
 
 def _cos_beta_and_derivs(alpha_deg, n_l, n_r):
     """Return cos(beta) and partials wrt (alpha_deg, n_l, n_r) for Snell's law."""
@@ -69,7 +97,7 @@ def _cos_beta_and_derivs(alpha_deg, n_l, n_r):
 # -----------------------------------------------------------------------------
 
 def _fwd_0(p):  # force_calculation_right
-    cos_b, _, _, _ = _cos_beta_and_derivs(p[..., 0], p[..., 1], p[..., 2])
+    cos_b = _cos_beta(p[..., 0], p[..., 1], p[..., 2])
     return (cos_b * _INV_CX).astype(np.complex128)[..., None]
 
 
@@ -88,8 +116,8 @@ def _fwd_2(p):  # surface
     ps_l = t_scale * n_l
     ps_r = t_scale * n_r
     cl = np.cos(alpha * _DEG)
-    cr_t, _, _, _ = _cos_beta_and_derivs(alpha, n_l, n_r)
-    cr_r, _, _, _ = _cos_beta_and_derivs(alpha, n_r, n_l)
+    cr_t = _cos_beta(alpha, n_l, n_r)
+    cr_r = _cos_beta(alpha, n_r, n_l)
     sqrt_r = np.sqrt(abs_r)
     sqrt_t = np.sqrt(abs_t)
     r_l = -sqrt_r * np.exp(1j * (ps_l * cl))
@@ -165,8 +193,8 @@ def _fwd_15(p):  # corrected_optomechanical_phase_right
         p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5], p[..., 6]
     )
     abs_r = (1.0 - loss) * r_frac
-    cr_om, _, _, _ = _cos_beta_and_derivs(alpha, n_l, n_r)
-    cr_rf, _, _, _ = _cos_beta_and_derivs(alpha, n_r, n_l)
+    cr_om = _cos_beta(alpha, n_l, n_r)
+    cr_rf = _cos_beta(alpha, n_r, n_l)
     t_rad = tuning * _DEG
     phase = -t_rad * (freq * _INV_F0) - 2.0 * t_rad * n_r * (1.0 + freq * _INV_F0) * cr_rf
     return (-1j * _Z_SCALE * cr_om * np.sqrt(abs_r) * np.exp(1j * phase))[..., None]
@@ -535,25 +563,18 @@ def _vjp_np_groups(g_buf: np.ndarray, params: np.ndarray, groups: tuple, g_param
     """Accumulate parameter gradients from sparse buffer cotangents into g_params."""
     B = params.shape[0]
     for f_idx, inp_idx, out_row, out_col, flat_pos, n_out_cols in groups:
+        vjp = NP_VJP_FUNCTIONS[f_idx]
+        if vjp is _vjp_zero:
+            continue
         K = inp_idx.shape[0]
         # Gather upstream cotangent for each (b, k, c)
         gy = np.zeros((B, K, n_out_cols), dtype=np.complex128)
         np.add.at(gy, (slice(None), out_row, out_col), g_buf[:, flat_pos])
-        gp_local = NP_VJP_FUNCTIONS[f_idx](params[:, inp_idx], gy)  # (B, K, 7)
-        # Scatter-add back into g_params (shape (B, P))
-        # Use flat accumulation for speed
+        gp_local = vjp(params[:, inp_idx], gy)
         if B == 1:
             np.add.at(g_params[0], inp_idx.ravel(), gp_local[0].ravel())
         else:
-            # Sum over batch directly if accumulating into a single parameter row,
-            # or accumulate per batch row when g_params has B rows.
-            if g_params.shape[0] == 1:
-                np.add.at(g_params[0], inp_idx.ravel(), gp_local.sum(axis=0).ravel())
-            else:
-                flat_inp = inp_idx.ravel()
-                gp_flat = gp_local.reshape(B, -1)
-                for j in range(flat_inp.size):
-                    g_params[:, flat_inp[j]] += gp_flat[:, j]
+            np.add.at(g_params, (slice(None), inp_idx.ravel()), gp_local.reshape(B, -1))
 
 
 def _expand_np(p_row: np.ndarray, indices: np.ndarray, values: np.ndarray) -> np.ndarray:
@@ -561,6 +582,22 @@ def _expand_np(p_row: np.ndarray, indices: np.ndarray, values: np.ndarray) -> np
     out = np.repeat(p_row, r, axis=0)
     out[:, indices] = values.T
     return out
+
+
+def _accumulate_sweep_vjp(g_parent, g_expanded, indices, sweep_values):
+    """Route overwritten columns to the sweep and reduce the others into the parent."""
+    if not indices.size:
+        g_parent += g_expanded
+        return np.zeros_like(sweep_values)
+
+    g_sweep = np.zeros_like(sweep_values)
+    # Assignment keeps the last value when a parameter occurs more than once.
+    _, last_reversed = np.unique(indices[::-1], return_index=True)
+    write_rows = indices.size - 1 - last_reversed
+    g_sweep[write_rows] = g_expanded[:, indices[write_rows]].T
+    g_expanded[:, indices] = 0
+    g_parent += g_expanded.sum(axis=0, keepdims=True)
+    return g_sweep
 
 
 # -----------------------------------------------------------------------------
@@ -597,12 +634,11 @@ def sparse_simulate_fwd_host(
     car_b = car_aug[:, nnz_c:]
 
     carrier = np.empty((b_car, cn), dtype=np.complex128)
-    gstrf = _superlu.gstrf
-    c_idx = topo.carrier_csc_indices
-    c_ptr = topo.carrier_csc_indptr
+    c_matrix = _csc_workspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
+    car_finite = np.isfinite(car_A).all(axis=1)
     for bi in range(b_car):
-        lu_c = gstrf(cn, nnz_c, car_A[bi], c_idx, c_ptr, ilu=False, options=_SUPERLU_OPTS, csc_construct_func=_noop_csc)
-        carrier[bi] = lu_c.solve(car_b[bi])
+        lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+        carrier[bi] = _solve_refined(c_matrix, lu_c, car_b[bi]) if lu_c is not None else np.nan
 
     # --- Signal assembly ---
     if topo.sig_ch_idx.size > 0:
@@ -619,9 +655,9 @@ def sparse_simulate_fwd_host(
         sig_aug = sig_aug_static
     _apply_np_groups(sig_aug, p_sig, topo.signal_groups_sweep)
 
+    carrier_couplings = sig_aug[:, topo.signal_carrier_flat_pos]
     if topo.signal_carrier_flat_pos.size > 0:
-        # Save pre-carrier-scaling values only if needed; we can recompute in bwd cheaply!
-        sig_aug[:, topo.signal_carrier_flat_pos] *= -carrier[:, topo.signal_carrier_indices]
+        sig_aug[:, topo.signal_carrier_flat_pos] = -carrier_couplings * carrier[:, topo.signal_carrier_indices]
 
     if topo.signal_conj_mask.any():
         sig_aug[:, topo.signal_conj_mask] = np.conj(sig_aug[:, topo.signal_conj_mask])
@@ -645,15 +681,19 @@ def sparse_simulate_fwd_host(
     # --- Signal + Adjoint Noise SuperLU solve (1 factorization per freq) ---
     signal = np.empty((b_sig, sn), dtype=np.complex128)
     w = np.empty((D, b_sig, sn), dtype=np.complex128)
-    s_idx = topo.signal_csc_indices
-    s_ptr = topo.signal_csc_indptr
+    s_matrix = _csc_workspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+    sig_finite = np.isfinite(sig_A).all(axis=1)
     for bi in range(b_sig):
-        lu_s = gstrf(sn, nnz_s, sig_A[bi], s_idx, s_ptr, ilu=False, options=_SUPERLU_OPTS, csc_construct_func=_noop_csc)
-        signal[bi] = lu_s.solve(sig_b[bi])
+        lu_s = _factorize(s_matrix, sig_A[bi]) if sig_finite[bi] else None
+        if lu_s is None:
+            signal[bi] = np.nan
+            w[:, bi] = np.nan
+            continue
+        signal[bi] = _solve_refined(s_matrix, lu_s, sig_b[bi])
         if D == 1:
-            w[0, bi] = lu_s.solve(c_sel_full[0, bi], trans="H")
+            w[0, bi] = _solve_refined(s_matrix, lu_s, c_sel_full[0, bi], trans="H")
         elif D > 1:
-            w[:, bi, :] = lu_s.solve(c_sel_full[:, bi, :].T, trans="H").T
+            w[:, bi, :] = _solve_refined(s_matrix, lu_s, c_sel_full[:, bi, :].T, trans="H").T
 
     # --- Quantum noise readout: Re(w^H N w) ---
     n_vals = np.broadcast_to(topo.noise_base_vals[None, :], (b_car, topo.nnz_n)).copy()
@@ -672,7 +712,7 @@ def sparse_simulate_fwd_host(
     else:
         noise = np.zeros((D, b_sig), dtype=np.float64)
 
-    return carrier, signal, noise, car_A, sig_A, w, n_vals
+    return carrier, signal, noise, car_A, sig_A, w, n_vals, carrier_couplings
 
 
 def sparse_simulate_bwd_host(
@@ -688,6 +728,7 @@ def sparse_simulate_bwd_host(
     sig_A_in,
     w_in,
     n_vals_in,
+    carrier_couplings_in,
     g_carrier_in,
     g_signal_in,
     g_noise_in,
@@ -704,6 +745,7 @@ def sparse_simulate_bwd_host(
     sig_A = np.asarray(sig_A_in, dtype=np.complex128)
     w = np.asarray(w_in, dtype=np.complex128)
     n_vals = np.asarray(n_vals_in, dtype=np.complex128)
+    carrier_couplings = np.asarray(carrier_couplings_in, dtype=np.complex128)
     g_carrier = np.asarray(g_carrier_in, dtype=np.complex128).copy()
     g_signal = np.asarray(g_signal_in, dtype=np.complex128)
     g_noise = np.asarray(g_noise_in, dtype=np.float64)
@@ -724,7 +766,10 @@ def sparse_simulate_bwd_host(
         p_sig = p_car
     b_sig = p_sig.shape[0]
 
-    g_p_base = np.zeros_like(p_base)  # (1, P) float64
+    g_p_base = np.zeros_like(p_base)
+    g_p_car = np.zeros_like(p_car)
+    g_p_sig = np.zeros_like(p_sig)
+    g_nsv = np.zeros_like(nsv_base)
 
     # 1. Backprop through noise = sqrt(_NOISE_SCALE * Re(w^H N w))
     g_w = np.zeros_like(w)  # (D, b_sig, sn) complex128
@@ -732,7 +777,8 @@ def sparse_simulate_bwd_host(
 
     if D > 0 and topo.nnz_n > 0:
         # g_temp_sum = g_noise * (_NOISE_SCALE / (2 * noise))
-        g_ts = np.where(noise > 0.0, g_noise * (0.5 * _NOISE_SCALE / noise), 0.0)  # (D, b_sig) float64
+        with np.errstate(divide="ignore", invalid="ignore"):
+            g_ts = g_noise * (0.5 * _NOISE_SCALE / noise)
         w_r = w[:, :, topo.noise_rows]  # (D, b_sig, nnz_n)
         w_c = w[:, :, topo.noise_cols]  # (D, b_sig, nnz_n)
         # Re(conj(w_r) * n_k * w_c):
@@ -751,31 +797,33 @@ def sparse_simulate_bwd_host(
             np.add.at(g_w[d], (slice(None), topo.noise_rows), g_wr[d])
             np.add.at(g_w[d], (slice(None), topo.noise_cols), g_wc[d])
 
-        # Backprop g_n_vals into g_p_base
         if topo.noise_groups_sweep:
-            _vjp_np_groups(g_n_vals, p_sig, topo.noise_groups_sweep, g_p_base)
+            _vjp_np_groups(g_n_vals, p_sig, topo.noise_groups_sweep, g_p_sig)
             g_n_static = g_n_vals.sum(axis=0, keepdims=True) if b_car == 1 else g_n_vals
         else:
             g_n_static = g_n_vals
-        _vjp_np_groups(g_n_static, p_car, topo.noise_groups_static, g_p_base)
+        _vjp_np_groups(g_n_static, p_car, topo.noise_groups_static, g_p_car)
 
     # 2. Backprop through SuperLU signal + adjoint noise solve
     g_sig_aug = np.empty((b_sig, nnz_s + sn), dtype=np.complex128)
     g_c_sel_full = np.zeros((D, b_sig, sn), dtype=np.complex128)
     lam_x_all = np.empty((b_sig, sn), dtype=np.complex128)
-    gstrf = _superlu.gstrf
-    s_idx = topo.signal_csc_indices
-    s_ptr = topo.signal_csc_indptr
+    s_matrix = _csc_workspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
     s_rows = topo.signal_csc_rows
     s_cols = topo.signal_csc_cols
 
+    sig_finite = np.isfinite(sig_A).all(axis=1)
     for bi in range(b_sig):
-        lu_s = gstrf(sn, nnz_s, sig_A[bi], s_idx, s_ptr, ilu=False, options=_SUPERLU_OPTS, csc_construct_func=_noop_csc)
-        lam_x_all[bi] = lu_s.solve(g_signal[bi], trans="T")
+        lu_s = _factorize(s_matrix, sig_A[bi]) if sig_finite[bi] else None
+        if lu_s is None:
+            lam_x_all[bi] = np.nan
+            g_c_sel_full[:, bi] = np.nan
+            continue
+        lam_x_all[bi] = _solve_refined(s_matrix, lu_s, g_signal[bi], trans="T")
         if D == 1:
-            g_c_sel_full[0, bi] = np.conj(lu_s.solve(np.conj(g_w[0, bi]), trans="N"))
+            g_c_sel_full[0, bi] = np.conj(_solve_refined(s_matrix, lu_s, np.conj(g_w[0, bi])))
         elif D > 1:
-            g_c_sel_full[:, bi, :] = np.conj(lu_s.solve(np.conj(g_w[:, bi, :].T), trans="N")).T
+            g_c_sel_full[:, bi, :] = np.conj(_solve_refined(s_matrix, lu_s, np.conj(g_w[:, bi, :].T))).T
 
     g_sig_aug[:, nnz_s:] = lam_x_all
     gA_all = -lam_x_all[:, s_rows] * signal[:, s_cols]
@@ -801,17 +849,16 @@ def sparse_simulate_bwd_host(
         # Re(g * conj(nsv * dcar)) = Re(conj(g) * nsv * dcar) -> g_carrier += sum_d(conj(g) * nsv)
         g_carrier += np.sum(np.conj(g_c_sel[:, :, cn : 2 * cn]) * nsv_b[:, :, cn : 2 * cn], axis=0)
 
+        g_nsv[:, :, :cn] = np.sum(g_c_sel[:, :, :cn] * carrier[None, :, :], axis=1, keepdims=True)
+        g_nsv[:, :, cn : 2 * cn] = np.sum(
+            np.conj(g_c_sel[:, :, cn : 2 * cn]) * carrier[None, :, :], axis=1, keepdims=True
+        )
+        g_nsv[:, :, 2 * cn :] = np.sum(g_c_sel[:, :, 2 * cn :], axis=1, keepdims=True)
         if topo.qhd_param_idx.size > 0:
-            g_nsv = np.zeros_like(nsv)
-            g_nsv[:, :, :cn] = np.sum(g_c_sel[:, :, :cn] * carrier[None, :, :], axis=1, keepdims=True)
-            g_nsv[:, :, cn : 2 * cn] = np.sum(
-                np.conj(g_c_sel[:, :, cn : 2 * cn]) * carrier[None, :, :], axis=1, keepdims=True
-            )
-            g_nsv[:, :, 2 * cn :] = np.sum(g_c_sel[:, :, 2 * cn :], axis=1, keepdims=True)
-            idx3 = topo.qhd_placing_idx.reshape(-1, 3)
-            # nsv_after = nsv_before * exp(1j * deg * p) -> d(nsv_after)/dp = 1j * deg * nsv_after
-            g_qhd = np.real(g_nsv[idx3[:, 0], idx3[:, 1], idx3[:, 2]] * (1j * _DEG * nsv[idx3[:, 0], idx3[:, 1], idx3[:, 2]]))
+            phase_positions = tuple(idx3.T)
+            g_qhd = np.real(g_nsv[phase_positions] * (1j * _DEG * nsv[phase_positions]))
             np.add.at(g_p_base[0], topo.qhd_param_idx, g_qhd)
+            g_nsv[phase_positions] *= qhd_phases
 
     # 4. Backprop through signal conjugation mask
     if topo.signal_conj_mask.any():
@@ -822,16 +869,8 @@ def sparse_simulate_bwd_host(
     if topo.signal_carrier_flat_pos.size > 0:
         pos = topo.signal_carrier_flat_pos
         c_idx = topo.signal_carrier_indices
-        # Reconstruct pre-scaling sig_before[pos] quickly (only ~2 ms!)
-        # Actually, since sig_after[pos] = -sig_before[pos] * carrier[c_idx] (after undoing conj!),
-        # let's compute sig_before directly from sig_aug_pre! Even safer (zero div-by-zero if carrier==0!):
-        sig_pre_static = np.broadcast_to(topo.signal_base_aug[None, :], (b_car, nnz_s + sn)).copy()
-        _apply_np_groups(sig_pre_static, p_car, topo.signal_groups_static)
-        sig_pre = np.broadcast_to(sig_pre_static, (b_sig, nnz_s + sn)).copy() if b_sig != b_car else sig_pre_static
-        _apply_np_groups(sig_pre, p_sig, topo.signal_groups_sweep)
-
         g_pos = g_sig_aug[:, pos]  # (b_sig, C_len)
-        g_car_contrib = -g_pos * sig_pre[:, pos]  # (b_sig, C_len)
+        g_car_contrib = -g_pos * carrier_couplings
         if b_car == 1:
             np.add.at(g_carrier[0], c_idx, g_car_contrib.sum(axis=0))
         else:
@@ -840,23 +879,28 @@ def sparse_simulate_bwd_host(
         g_sig_aug[:, pos] = -g_pos * carrier[:, c_idx]
 
     # 6. Backprop through signal component functions (sweep & static)
-    _vjp_np_groups(g_sig_aug, p_sig, topo.signal_groups_sweep, g_p_base)
+    _vjp_np_groups(g_sig_aug, p_sig, topo.signal_groups_sweep, g_p_sig)
     if topo.signal_groups_static:
         g_sig_static = g_sig_aug.sum(axis=0, keepdims=True) if b_car == 1 else g_sig_aug
-        _vjp_np_groups(g_sig_static, p_car, topo.signal_groups_static, g_p_base)
+        _vjp_np_groups(g_sig_static, p_car, topo.signal_groups_static, g_p_car)
 
     # 7. Backprop through carrier SuperLU solve -> carrier component functions -> g_p_base
     g_car_aug = np.empty((b_car, nnz_c + cn), dtype=np.complex128)
     c_rows = topo.carrier_csc_rows
     c_cols = topo.carrier_csc_cols
-    c_idx = topo.carrier_csc_indices
-    c_ptr = topo.carrier_csc_indptr
+    c_matrix = _csc_workspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
+    car_finite = np.isfinite(car_A).all(axis=1)
     for bi in range(b_car):
-        lu_c = gstrf(cn, nnz_c, car_A[bi], c_idx, c_ptr, ilu=False, options=_SUPERLU_OPTS, csc_construct_func=_noop_csc)
-        lam_c = lu_c.solve(g_carrier[bi], trans="T")
+        lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+        if lu_c is None:
+            g_car_aug[bi] = np.nan
+            continue
+        lam_c = _solve_refined(c_matrix, lu_c, g_carrier[bi], trans="T")
         g_car_aug[bi, nnz_c:] = lam_c
         g_car_aug[bi, :nnz_c] = -lam_c[c_rows] * carrier[bi, c_cols]
 
-    _vjp_np_groups(g_car_aug, p_car, topo.carrier_groups, g_p_base)
+    _vjp_np_groups(g_car_aug, p_car, topo.carrier_groups, g_p_car)
 
-    return g_p_base
+    g_sig_ch = _accumulate_sweep_vjp(g_p_car, g_p_sig, topo.sig_ch_idx, sig_ch_vals)
+    g_car_ch = _accumulate_sweep_vjp(g_p_base, g_p_car, topo.car_ch_idx, car_ch_vals)
+    return g_p_base, g_car_ch, g_sig_ch, g_nsv

@@ -24,6 +24,7 @@ from functools import partial
 from time import time
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax, vmap, jit
 
 from differometor.setups import Setup
@@ -78,14 +79,30 @@ def expand_parameters(array: jnp.ndarray, indices: jnp.ndarray, values: jnp.ndar
 # Single-callback Sparse Forward + Exact Analytical VJP
 # -----------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(4,))
+def _insert_optimized_parameters(parameters, optimized, topology, bind_parameters):
+    if not bind_parameters:
+        return parameters
+    bound = np.array(parameters, copy=True)
+    bound[0, topology.opt_param_idx] = np.asarray(optimized)[topology.opt_val_idx]
+    return bound
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6))
 def _sparse_simulate_core(
+    optimized: jnp.ndarray,
     p_base: jnp.ndarray,
     car_ch_vals: jnp.ndarray,
     sig_ch_vals: jnp.ndarray,
     nsv: jnp.ndarray,
     topo: SparseTopology,
+    bind_parameters: bool,
 ):
+    return _sparse_forward(
+        optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters, save_residuals=False
+    )
+
+
+def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters, *, save_residuals):
     b_car = car_ch_vals.shape[1] if topo.car_ch_idx.size > 0 else 1
     b_sig = sig_ch_vals.shape[1] if topo.sig_ch_idx.size > 0 else b_car
     b_n = b_sig if topo.noise_groups_sweep else b_car
@@ -99,71 +116,49 @@ def _sparse_simulate_core(
         jax.ShapeDtypeStruct((b_sig, topo.nnz_s), jnp.complex128),
         jax.ShapeDtypeStruct((D, b_sig, topo.sn), jnp.complex128),
         jax.ShapeDtypeStruct((b_n, topo.nnz_n), jnp.complex128),
+        jax.ShapeDtypeStruct((b_sig, topo.signal_carrier_flat_pos.size), jnp.complex128),
     )
 
-    def _call(p_b, c_v, s_v, n_v):
-        return sparse_simulate_fwd_host(topo, p_b, c_v, s_v, n_v)
+    if not save_residuals:
+        specs = specs[:3]
 
-    carrier, signal, noise, _, _, _, _ = jax.pure_callback(
-        _call, specs, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential"
-    )
-    return carrier, signal, noise
+    def _call(opt, base, car_sweep, sig_sweep, vectors):
+        bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
+        results = sparse_simulate_fwd_host(topo, bound, car_sweep, sig_sweep, vectors)
+        return results if save_residuals else results[:3]
 
-
-def _sparse_simulate_core_fwd(p_base, car_ch_vals, sig_ch_vals, nsv, topo):
-    b_car = car_ch_vals.shape[1] if topo.car_ch_idx.size > 0 else 1
-    b_sig = sig_ch_vals.shape[1] if topo.sig_ch_idx.size > 0 else b_car
-    b_n = b_sig if topo.noise_groups_sweep else b_car
-    D = topo.num_detectors
-
-    specs = (
-        jax.ShapeDtypeStruct((b_car, topo.cn), jnp.complex128),
-        jax.ShapeDtypeStruct((b_sig, topo.sn), jnp.complex128),
-        jax.ShapeDtypeStruct((D, b_sig), jnp.float64),
-        jax.ShapeDtypeStruct((b_car, topo.nnz_c), jnp.complex128),
-        jax.ShapeDtypeStruct((b_sig, topo.nnz_s), jnp.complex128),
-        jax.ShapeDtypeStruct((D, b_sig, topo.sn), jnp.complex128),
-        jax.ShapeDtypeStruct((b_n, topo.nnz_n), jnp.complex128),
+    return jax.pure_callback(
+        _call, specs, optimized, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential"
     )
 
-    def _call(p_b, c_v, s_v, n_v):
-        return sparse_simulate_fwd_host(topo, p_b, c_v, s_v, n_v)
 
-    carrier, signal, noise, car_A, sig_A, w, n_vals = jax.pure_callback(
-        _call, specs, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential"
-    )
-    res = (p_base, car_ch_vals, sig_ch_vals, nsv, carrier, signal, noise, car_A, sig_A, w, n_vals)
-    return (carrier, signal, noise), res
+def _sparse_simulate_core_fwd(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind_parameters):
+    inputs = (optimized, p_base, car_ch_vals, sig_ch_vals, nsv)
+    results = _sparse_forward(*inputs, topo, bind_parameters, save_residuals=True)
+    return results[:3], (*inputs, *results)
 
 
-def _sparse_simulate_core_bwd(topo, res, g):
-    p_base, car_ch_vals, sig_ch_vals, nsv, carrier, signal, noise, car_A, sig_A, w, n_vals = res
-    g_carrier, g_signal, g_noise = g
-    gp_spec = jax.ShapeDtypeStruct(p_base.shape, jnp.float64)
+def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
+    specs = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in res[:5])
 
-    def _call_bwd(p_b, c_v, s_v, n_v, car, sig, noi, cA, sA, ww, nv, gc, gs, gn):
-        return sparse_simulate_bwd_host(topo, p_b, c_v, s_v, n_v, car, sig, noi, cA, sA, ww, nv, gc, gs, gn)
+    def _call_bwd(opt, base, *values):
+        bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
+        g_base, *rest = sparse_simulate_bwd_host(topo, bound, *values)
+        g_opt = np.zeros(opt.shape, dtype=g_base.dtype)
+        if bind_parameters:
+            indices = topo.opt_param_idx
+            np.add.at(g_opt, topo.opt_val_idx, g_base[0, indices])
+            g_base[0, indices] = 0
+        gradients = (g_opt, g_base, *rest)
+        return tuple(gradient.astype(spec.dtype, copy=False) for gradient, spec in zip(gradients, specs))
 
-    g_p_base = jax.pure_callback(
+    return jax.pure_callback(
         _call_bwd,
-        gp_spec,
-        p_base,
-        car_ch_vals,
-        sig_ch_vals,
-        nsv,
-        carrier,
-        signal,
-        noise,
-        car_A,
-        sig_A,
-        w,
-        n_vals,
-        g_carrier,
-        g_signal,
-        g_noise,
+        specs,
+        *res,
+        *g,
         vmap_method="sequential",
     )
-    return g_p_base, None, None, None
 
 
 _sparse_simulate_core.defvjp(_sparse_simulate_core_fwd, _sparse_simulate_core_bwd)
@@ -191,23 +186,29 @@ def simulate(
         Quantum noise amplitude spectral density, shape (D, SV) after squeeze.
     """
     p_base = parameters
-    if topology.opt_param_idx.size > 0:
-        p_base = p_base.at[0, topology.opt_param_idx].set(
-            optimized_parameters[topology.opt_val_idx].astype(jnp.float64)
-        )
-
+    bind_parameters = topology.opt_param_idx.size > 0
+    if optimized_parameters is None and not bind_parameters:
+        optimized_parameters = jnp.zeros((0,), dtype=p_base.dtype)
     if linked_groups:
+        if bind_parameters:
+            p_base = p_base.at[0, topology.opt_param_idx].set(
+                optimized_parameters[topology.opt_val_idx].astype(p_base.dtype), unique_indices=True
+            )
+        bind_parameters = False
+        link_input = p_base[0]
         for link_idx, (src_idx, dst_idx) in linked_groups.items():
             link_fn = LINKING_FUNCTIONS[link_idx]
-            vals = vmap(link_fn)(p_base[0, src_idx])
+            vals = vmap(link_fn)(link_input[src_idx])
             p_base = p_base.at[0, dst_idx].set(jnp.real(vals).astype(jnp.float64))
 
     carrier, signal, noise = _sparse_simulate_core(
+        optimized_parameters,
         p_base,
         carrier_changing_values,
         signal_changing_values,
         noise_selection_vectors,
         topology,
+        bind_parameters,
     )
     return carrier.T, signal.T, noise.squeeze()
 
