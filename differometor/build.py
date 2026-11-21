@@ -92,6 +92,103 @@ Notes
 """
 
 
+_IDX_FORCE_RIGHT = FUNCTIONS.index(force_calculation_right)
+_IDX_LASER = FUNCTIONS.index(laser)
+_IDX_SURFACE = FUNCTIONS.index(surface)
+_IDX_SPACE = FUNCTIONS.index(space)
+_IDX_SPACE_MOD = FUNCTIONS.index(space_modulation)
+_IDX_SIGNAL = FUNCTIONS.index(signal_function)
+_IDX_DUMMY = FUNCTIONS.index(dummy_function)
+_IDX_VACUUM_NOISE = FUNCTIONS.index(vacuum_quantum_noise)
+_IDX_LOSS_NOISE = FUNCTIONS.index(loss_quantum_noise)
+_IDX_SPACE_LOWER = FUNCTIONS.index(space_lower)
+_IDX_LASER_AMP_MOD = FUNCTIONS.index(laser_amplitude_modulation)
+_IDX_LASER_FREQ_MOD = FUNCTIONS.index(laser_frequency_modulation)
+_IDX_SUSCEPTIBILITY = FUNCTIONS.index(susceptibility)
+_IDX_FORCE_LEFT = FUNCTIONS.index(force_calculation_left)
+_IDX_OM_PHASE_LEFT = FUNCTIONS.index(corrected_optomechanical_phase_left)
+_IDX_OM_PHASE_RIGHT = FUNCTIONS.index(corrected_optomechanical_phase_right)
+_IDX_SPACE_MOD_LOWER = FUNCTIONS.index(space_modulation_lower)
+_IDX_SQUEEZER = FUNCTIONS.index(squeezer)
+_IDX_LASER_FREQ_MOD_LOWER = FUNCTIONS.index(laser_frequency_modulation_lower)
+
+_MIRROR_OUT_COL = np.array([0, 1, 1, 2], dtype=np.int32)
+_MIRROR_ROW_OFF = np.array([1, 1, 3, 3], dtype=np.int32)
+_MIRROR_COL_OFF = np.array([0, 2, 0, 2], dtype=np.int32)
+_MIRROR_NOISE_OUT_COL = np.array([0, 0], dtype=np.int32)
+_MIRROR_NOISE_OFF = np.array([1, 3], dtype=np.int32)
+
+_BS_OUT_COL = np.array([0, 1, 0, 1, 1, 2, 1, 2], dtype=np.int32)
+_BS_ROW_OFF = np.array([1, 1, 3, 3, 5, 5, 7, 7], dtype=np.int32)
+_BS_COL_OFF = np.array([2, 4, 0, 6, 0, 6, 2, 4], dtype=np.int32)
+_BS_NOISE_OUT_COL = np.array([0, 0, 0, 0], dtype=np.int32)
+_BS_NOISE_OFF = np.array([1, 3, 5, 7], dtype=np.int32)
+
+_MIRROR_SIG_OUT_COL = np.concatenate((_MIRROR_OUT_COL, _MIRROR_OUT_COL))
+_MIRROR_SIG_NOISE_OUT_COL = np.concatenate((_MIRROR_NOISE_OUT_COL, _MIRROR_NOISE_OUT_COL))
+_BS_SIG_OUT_COL = np.concatenate((_BS_OUT_COL, _BS_OUT_COL))
+_BS_SIG_NOISE_OUT_COL = np.concatenate((_BS_NOISE_OUT_COL, _BS_NOISE_OUT_COL))
+_SURFACE_FUNC_LIST = [_IDX_SURFACE]
+_LOSS_NOISE_FUNC_LIST = [_IDX_LOSS_NOISE]
+_VACUUM_INP_PADDED = np.zeros((1, 7), dtype=np.int32)
+_VACUUM_OUT_COL_2 = np.zeros(2, dtype=np.int32)
+_VACUUM_FUNC_LIST = [_IDX_VACUUM_NOISE]
+
+
+def _expand_sidebands(rows: np.ndarray, cols: np.ndarray, s: int, extra1: np.ndarray, extra2: np.ndarray | None = None):
+    """Expand (rows, cols) and aligned extra arrays across upper/lower sidebands."""
+    r_lt = rows < s
+    c_lt = cols < s
+    if r_lt.all() and c_lt.all():
+        new_rows = np.concatenate((rows, rows + s))
+        new_cols = np.concatenate((cols, cols + s))
+        new_e1 = np.concatenate((extra1, extra1))
+        new_e2 = np.concatenate((extra2, extra2)) if extra2 is not None else None
+        return new_rows, new_cols, new_e1, new_e2
+
+    base_r = np.where(r_lt, rows, rows + s)
+    base_c = np.where(c_lt, cols, cols + s)
+
+    only_r = r_lt & ~c_lt
+    only_c = ~r_lt & c_lt
+    both = r_lt & c_lt
+
+    r_parts = [base_r]
+    c_parts = [base_c]
+    e1_parts = [extra1]
+    e2_parts = [extra2] if extra2 is not None else None
+
+    if only_r.any():
+        r_parts.append(base_r[only_r] + s)
+        c_parts.append(base_c[only_r])
+        e1_parts.append(extra1[only_r])
+        if e2_parts is not None:
+            e2_parts.append(extra2[only_r])
+
+    if only_c.any():
+        r_parts.append(base_r[only_c])
+        c_parts.append(base_c[only_c] + s)
+        e1_parts.append(extra1[only_c])
+        if e2_parts is not None:
+            e2_parts.append(extra2[only_c])
+
+    if both.any():
+        r_parts.append(base_r[both] + s)
+        c_parts.append(base_c[both] + s)
+        e1_parts.append(extra1[both])
+        if e2_parts is not None:
+            e2_parts.append(extra2[both])
+
+    if len(r_parts) == 1:
+        return base_r, base_c, extra1, extra2
+    return (
+        np.concatenate(r_parts),
+        np.concatenate(c_parts),
+        np.concatenate(e1_parts),
+        np.concatenate(e2_parts) if e2_parts is not None else None,
+    )
+
+
 def set_instructions(
     instructions: dict,
     node: str,
@@ -106,238 +203,46 @@ def set_instructions(
     carrier_column_indices: np.ndarray | None = None,
     system_size_for_sidebands: int | None = None,
 ) -> None:
-    """
-    Store standardized update instructions for one logical component.
+    """Store standardized update instructions for one logical component."""
+    n_rows, n_cols = function_input_indices.shape
+    if n_cols < 7:
+        padded = np.zeros((n_rows, 7), dtype=np.int32)
+        padded[:, :n_cols] = function_input_indices
+        function_input_indices = padded
+    elif n_cols != 7:
+        raise AssertionError("Function input indices have to be standardized to length 7.")
 
-    These instructions tell the solver how to:
-    - Read the relevant parameter indices (`function_input_indices`),
-    - Call one or more functions (`function_indices`) from `differometor.components.FUNCTIONS`,
-    - Select outputs (`output_row_indices`, `output_column_indices`),
-    - Place the resulting values into the system (or noise) matrix at
-      (`system_matrix_row_indices`, `system_matrix_column_indices`).
-
-    The function optionally expands indices for a two-sideband signal system by duplicating
-    appropriate entries when `system_size_for_sidebands` is provided.
-
-    Parameters
-    ----------
-    instructions:
-        Dictionary that is updated in-place. Keys are node identifiers.
-    node:
-        Key under which the instruction set is stored.
-    function_input_indices:
-        Integer array with shape `(N, K)` where each row lists parameter indices used
-        by one function call. This function standardizes `K` to 7 by padding with zeros.
-    output_column_indices:
-        Integer array of length `M`. Each entry selects a column of the called function output.
-    system_matrix_row_indices:
-        Integer array of length `M`. Target row indices in the destination matrix.
-    system_matrix_column_indices:
-        Integer array of length `M`. Target column indices in the destination matrix.
-    function_indices:
-        List of integer indices into `FUNCTIONS`, one per function call.
-    output_row_indices:
-        Optional integer array that selects output rows when multiple function calls are stacked.
-        If omitted, downstream code typically assumes a single-row output per component.
-    carrier_indices, carrier_row_indices, carrier_column_indices:
-        Optional arrays that specify which entries from the carrier solution are needed to compute
-        signal updates, and where those carrier values must be multiplied in.
-    system_size_for_sidebands:
-        If provided, expand indices to account for two sidebands in the signal/noise matrices.
-        Entries in the carrier-sized block (indices `< system_size_for_sidebands`) may be duplicated
-        and shifted to represent the second sideband.
-
-    Raises
-    ------
-    AssertionError
-        If shapes and index arrays are inconsistent.
-    """
-    function_input_indices_shape = 7
-
-    # Standardize function input length to 7 by padding with placeholder zeros.
-    if function_input_indices.shape[1] < function_input_indices_shape:
-        pad_width = function_input_indices_shape - function_input_indices.shape[1]
-        function_input_indices = np.concatenate(
-            [function_input_indices, np.zeros((function_input_indices.shape[0], pad_width))],
-            axis=1,
-        )
-
-    assert (
-        function_input_indices.shape[1] == function_input_indices_shape
-    ), f"Function input indices have to be standardized to length {function_input_indices_shape}."
-    assert len(output_column_indices) == len(
-        system_matrix_row_indices
-    ), "Output column indices have to match the length of system matrix row indices."
-
-    # Copy carrier indexing arrays to avoid accidental mutations by sideband expansion.
-    if carrier_indices is not None:
-        carrier_indices = carrier_indices.copy()
-        carrier_row_indices = carrier_row_indices.copy()
-        carrier_column_indices = carrier_column_indices.copy()
+    if len(output_column_indices) != len(system_matrix_row_indices):
+        raise AssertionError("Output column indices have to match the length of system matrix row indices.")
 
     if system_size_for_sidebands is not None:
-        # The signal and noise matrices contain two carrier-sized blocks:
-        # - Upper sideband: indices [0, system_size)
-        # - Lower sideband: indices [system_size, 2 * system_size)
-        #
-        # Plus additional signal degrees of freedom appended afterward.
-        #
-        # Any entry that references the carrier-sized portion must be duplicated and shifted
-        # appropriately to also exist in the second sideband block. Entries that already live
-        # in the appended signal block must be shifted because the carrier block is duplicated.
-
-        only_row_mask = (system_matrix_row_indices < system_size_for_sidebands) & (
-            system_matrix_column_indices >= system_size_for_sidebands
+        (
+            system_matrix_row_indices,
+            system_matrix_column_indices,
+            output_column_indices,
+            output_row_indices,
+        ) = _expand_sidebands(
+            system_matrix_row_indices,
+            system_matrix_column_indices,
+            system_size_for_sidebands,
+            output_column_indices,
+            output_row_indices,
         )
-        only_column_mask = (system_matrix_column_indices < system_size_for_sidebands) & (
-            system_matrix_row_indices >= system_size_for_sidebands
-        )
-        row_and_column_mask = (system_matrix_row_indices < system_size_for_sidebands) & (
-            system_matrix_column_indices < system_size_for_sidebands
-        )
-        pure_signal_mask = (system_matrix_row_indices >= system_size_for_sidebands) & (
-            system_matrix_column_indices >= system_size_for_sidebands
-        )
-
-        # Shift indices for entries that belong to the appended signal block.
-        system_matrix_column_indices[pure_signal_mask] += system_size_for_sidebands
-        system_matrix_row_indices[pure_signal_mask] += system_size_for_sidebands
-
-        # Shift the side that references the appended signal block in mixed entries.
-        system_matrix_column_indices[only_row_mask] += system_size_for_sidebands
-        system_matrix_row_indices[only_column_mask] += system_size_for_sidebands
-
-        new_system_matrix_row_indices = system_matrix_row_indices.copy()
-        new_system_matrix_column_indices = system_matrix_column_indices.copy()
-        new_output_column_indices = output_column_indices.copy()
-        new_output_row_indices = output_row_indices.copy() if output_row_indices is not None else None
-
-        # Duplicate entries for the second sideband where needed.
-        if only_row_mask.any():
-            new_system_matrix_row_indices = np.concatenate(
-                [new_system_matrix_row_indices, system_matrix_row_indices[only_row_mask] + system_size_for_sidebands]
-            )
-            new_system_matrix_column_indices = np.concatenate(
-                [new_system_matrix_column_indices, system_matrix_column_indices[only_row_mask]]
-            )
-            new_output_column_indices = np.concatenate(
-                [new_output_column_indices, output_column_indices[only_row_mask]]
-            )
-            if output_row_indices is not None:
-                new_output_row_indices = np.concatenate([new_output_row_indices, output_row_indices[only_row_mask]])
-
-        if only_column_mask.any():
-            new_system_matrix_column_indices = np.concatenate(
-                [
-                    new_system_matrix_column_indices,
-                    system_matrix_column_indices[only_column_mask] + system_size_for_sidebands,
-                ]
-            )
-            new_system_matrix_row_indices = np.concatenate(
-                [new_system_matrix_row_indices, system_matrix_row_indices[only_column_mask]]
-            )
-            new_output_column_indices = np.concatenate(
-                [new_output_column_indices, output_column_indices[only_column_mask]]
-            )
-            if output_row_indices is not None:
-                new_output_row_indices = np.concatenate([new_output_row_indices, output_row_indices[only_column_mask]])
-
-        if row_and_column_mask.any():
-            new_system_matrix_column_indices = np.concatenate(
-                [
-                    new_system_matrix_column_indices,
-                    system_matrix_column_indices[row_and_column_mask] + system_size_for_sidebands,
-                ]
-            )
-            new_system_matrix_row_indices = np.concatenate(
-                [
-                    new_system_matrix_row_indices,
-                    system_matrix_row_indices[row_and_column_mask] + system_size_for_sidebands,
-                ]
-            )
-            new_output_column_indices = np.concatenate(
-                [new_output_column_indices, output_column_indices[row_and_column_mask]]
-            )
-            if output_row_indices is not None:
-                new_output_row_indices = np.concatenate([new_output_row_indices, output_row_indices[row_and_column_mask]])
-
-        output_column_indices = new_output_column_indices
-        output_row_indices = new_output_row_indices
-        system_matrix_row_indices = new_system_matrix_row_indices
-        system_matrix_column_indices = new_system_matrix_column_indices
-
-        # Apply the same duplication and shifting logic to carrier-index instructions.
         if carrier_indices is not None:
-            only_row_mask = (carrier_row_indices < system_size_for_sidebands) & (
-                carrier_column_indices >= system_size_for_sidebands
+            (
+                carrier_row_indices,
+                carrier_column_indices,
+                carrier_indices,
+                _,
+            ) = _expand_sidebands(
+                carrier_row_indices,
+                carrier_column_indices,
+                system_size_for_sidebands,
+                carrier_indices,
+                None,
             )
-            only_column_mask = (carrier_column_indices < system_size_for_sidebands) & (
-                carrier_row_indices >= system_size_for_sidebands
-            )
-            row_and_column_mask = (carrier_row_indices < system_size_for_sidebands) & (
-                carrier_column_indices < system_size_for_sidebands
-            )
-            pure_signal_mask = (carrier_row_indices >= system_size_for_sidebands) & (
-                carrier_column_indices >= system_size_for_sidebands
-            )
 
-            carrier_column_indices[pure_signal_mask] += system_size_for_sidebands
-            carrier_row_indices[pure_signal_mask] += system_size_for_sidebands
-            carrier_column_indices[only_row_mask] += system_size_for_sidebands
-            carrier_row_indices[only_column_mask] += system_size_for_sidebands
-
-            new_carrier_row_indices = carrier_row_indices.copy()
-            new_carrier_column_indices = carrier_column_indices.copy()
-            new_carrier_indices = carrier_indices.copy()
-
-            if only_row_mask.any():
-                new_carrier_row_indices = np.concatenate(
-                    [new_carrier_row_indices, carrier_row_indices[only_row_mask] + system_size_for_sidebands]
-                )
-                new_carrier_column_indices = np.concatenate(
-                    [new_carrier_column_indices, carrier_column_indices[only_row_mask]]
-                )
-                new_carrier_indices = np.concatenate([new_carrier_indices, carrier_indices[only_row_mask]])
-
-            if only_column_mask.any():
-                new_carrier_column_indices = np.concatenate(
-                    [
-                        new_carrier_column_indices,
-                        carrier_column_indices[only_column_mask] + system_size_for_sidebands,
-                    ]
-                )
-                new_carrier_row_indices = np.concatenate(
-                    [new_carrier_row_indices, carrier_row_indices[only_column_mask]]
-                )
-                new_carrier_indices = np.concatenate([new_carrier_indices, carrier_indices[only_column_mask]])
-
-            if row_and_column_mask.any():
-                new_carrier_column_indices = np.concatenate(
-                    [
-                        new_carrier_column_indices,
-                        carrier_column_indices[row_and_column_mask] + system_size_for_sidebands,
-                    ]
-                )
-                new_carrier_row_indices = np.concatenate(
-                    [
-                        new_carrier_row_indices,
-                        carrier_row_indices[row_and_column_mask] + system_size_for_sidebands,
-                    ]
-                )
-                new_carrier_indices = np.concatenate([new_carrier_indices, carrier_indices[row_and_column_mask]])
-
-            carrier_indices = new_carrier_indices
-            carrier_row_indices = new_carrier_row_indices
-            carrier_column_indices = new_carrier_column_indices
-
-    assert (
-        function_input_indices.shape[1] == function_input_indices_shape
-    ), f"Function input indices have to be standardized to length {function_input_indices_shape}."
-    assert len(output_column_indices) == len(
-        system_matrix_row_indices
-    ), "Output column indices have to match the length of system matrix row indices."
-
-    instructions[node] = {
+    entry = {
         "function_input_indices": function_input_indices,
         "output_column_indices": output_column_indices,
         "system_matrix_row_indices": system_matrix_row_indices,
@@ -345,13 +250,12 @@ def set_instructions(
         "function_indices": function_indices,
     }
     if output_row_indices is not None:
-        instructions[node]["output_row_indices"] = output_row_indices
-
-    # Carrier-solution coupling information for signal updates.
+        entry["output_row_indices"] = output_row_indices
     if carrier_indices is not None:
-        instructions[node]["carrier_indices"] = carrier_indices
-        instructions[node]["carrier_row_indices"] = carrier_row_indices
-        instructions[node]["carrier_column_indices"] = carrier_column_indices
+        entry["carrier_indices"] = carrier_indices
+        entry["carrier_row_indices"] = carrier_row_indices
+        entry["carrier_column_indices"] = carrier_column_indices
+    instructions[node] = entry
 
 
 def parameter_linking(
@@ -405,7 +309,7 @@ def parameter_linking(
             linked_names.append(new_parameter[0])
 
 
-def build(setup: Setup, as_jax: bool = True):
+def build(setup: Setup, as_jax: bool = True, _sparse_signal: bool = False):
     """
     Build carrier, signal, and noise matrices plus update instructions from a setup graph.
 
@@ -657,11 +561,15 @@ def build(setup: Setup, as_jax: bool = True):
         signal_size = 1
 
     # Signal matrix includes two carrier-sized blocks plus appended signal block, plus a right-hand-side column.
-    signal_matrix = np.zeros((system_size * 2 + signal_size, system_size * 2 + signal_size + 1), dtype=complex)
-    np.fill_diagonal(signal_matrix, 1)
+    signal_dim = system_size * 2 + signal_size
+    if _sparse_signal:
+        signal_matrix = signal_dim
+    else:
+        signal_matrix = np.zeros((signal_dim, signal_dim + 1), dtype=complex)
+        np.fill_diagonal(signal_matrix, 1)
 
     # Noise matrix has the same shape as the signal matrix without the right-hand side.
-    noise_matrix = np.zeros(signal_matrix[:, :-1].shape) if as_jax else None
+    noise_matrix = np.zeros((signal_dim, signal_dim)) if as_jax else None
     noise_detectors = {}
 
     # Selection vectors map fields to detector readouts for quantum noise calculations.
@@ -703,7 +611,7 @@ def build(setup: Setup, as_jax: bool = True):
                 output_column_indices=np.array([0]),
                 system_matrix_row_indices=np.array([system_size * 2 + signal_index]),
                 system_matrix_column_indices=np.array([-1]),
-                function_indices=[FUNCTIONS.index(signal_function)],
+                function_indices=[_IDX_SIGNAL],
             )
 
         # -----------------------------
@@ -783,7 +691,7 @@ def build(setup: Setup, as_jax: bool = True):
                     output_column_indices=np.array([0]),
                     system_matrix_row_indices=np.array([component_index]),
                     system_matrix_column_indices=np.array([-1]),
-                    function_indices=[FUNCTIONS.index(laser)],
+                    function_indices=[_IDX_LASER],
                 )
 
                 set_instructions(
@@ -793,7 +701,7 @@ def build(setup: Setup, as_jax: bool = True):
                     output_column_indices=np.array([0]),
                     system_matrix_row_indices=np.array([component_index]),
                     system_matrix_column_indices=np.array([component_index]),
-                    function_indices=[FUNCTIONS.index(vacuum_quantum_noise)],
+                    function_indices=[_IDX_VACUUM_NOISE],
                     system_size_for_sidebands=system_size,
                 )
 
@@ -822,7 +730,7 @@ def build(setup: Setup, as_jax: bool = True):
                     system_matrix_column_indices=np.array(
                         [component_index, component_index + system_size, component_index + system_size, component_index]
                     ),
-                    function_indices=[FUNCTIONS.index(squeezer)],
+                    function_indices=[_IDX_SQUEEZER],
                 )
 
         # -----------------------------
@@ -915,12 +823,13 @@ def build(setup: Setup, as_jax: bool = True):
                     ]
                 )
 
-                output_column_indices = np.array([0, 1, 1, 2])
-                system_matrix_row_indices = component_index + np.array([1, 1, 3, 3])
-                system_matrix_column_indices = component_index + np.array([0, 2, 0, 2])
+                output_column_indices = _MIRROR_OUT_COL
+                system_matrix_row_indices = component_index + _MIRROR_ROW_OFF
+                system_matrix_column_indices = component_index + _MIRROR_COL_OFF
 
-                noise_output_column_indices = np.array([0, 0])
-                noise_system_matrix_indices = component_index + np.array([1, 3])
+                sig_output_column_indices = _MIRROR_SIG_OUT_COL
+                sig_noise_output_column_indices = _MIRROR_SIG_NOISE_OUT_COL
+                noise_system_matrix_indices = component_index + _MIRROR_NOISE_OFF
 
             elif data["component"] == "beamsplitter":
                 refractive_index_left_position = surfaces_to_refractive_index_parameter_position[node].get("left", 1)
@@ -978,12 +887,13 @@ def build(setup: Setup, as_jax: bool = True):
                     ]
                 )
 
-                output_column_indices = np.array([0, 1, 0, 1, 1, 2, 1, 2])
-                system_matrix_row_indices = component_index + np.array([1, 1, 3, 3, 5, 5, 7, 7])
-                system_matrix_column_indices = component_index + np.array([2, 4, 0, 6, 0, 6, 2, 4])
+                output_column_indices = _BS_OUT_COL
+                system_matrix_row_indices = component_index + _BS_ROW_OFF
+                system_matrix_column_indices = component_index + _BS_COL_OFF
 
-                noise_output_column_indices = np.array([0, 0, 0, 0])
-                noise_system_matrix_indices = component_index + np.array([1, 3, 5, 7])
+                sig_output_column_indices = _BS_SIG_OUT_COL
+                sig_noise_output_column_indices = _BS_SIG_NOISE_OUT_COL
+                noise_system_matrix_indices = component_index + _BS_NOISE_OFF
 
             # Initialize the carrier matrix diagonal block for the surface.
             carrier_matrix[
@@ -991,40 +901,34 @@ def build(setup: Setup, as_jax: bool = True):
                 component_index : component_index + matrix.shape[1],
             ] = matrix
 
-            # Carrier update instructions for the surface.
-            set_instructions(
-                carrier_instructions,
-                node,
-                function_input_indices=function_input_indices,
-                output_column_indices=output_column_indices,
-                system_matrix_row_indices=system_matrix_row_indices,
-                system_matrix_column_indices=system_matrix_column_indices,
-                function_indices=[FUNCTIONS.index(surface)],
-            )
+            # Carrier update instructions for the surface (function_input_indices already width 7).
+            carrier_instructions[node] = {
+                "function_input_indices": function_input_indices,
+                "output_column_indices": output_column_indices,
+                "system_matrix_row_indices": system_matrix_row_indices,
+                "system_matrix_column_indices": system_matrix_column_indices,
+                "function_indices": _SURFACE_FUNC_LIST,
+            }
 
-            # Signal update instructions: same surface function but sideband-aware frequency.
-            set_instructions(
-                signal_instructions,
-                node,
-                function_input_indices=signal_function_input_indices,
-                output_column_indices=output_column_indices,
-                system_matrix_row_indices=system_matrix_row_indices,
-                system_matrix_column_indices=system_matrix_column_indices,
-                function_indices=[FUNCTIONS.index(surface)],
-                system_size_for_sidebands=system_size,
-            )
+            # Signal & noise instructions: all port indices are strictly < system_size.
+            signal_instructions[node] = {
+                "function_input_indices": signal_function_input_indices,
+                "output_column_indices": sig_output_column_indices,
+                "system_matrix_row_indices": np.concatenate((system_matrix_row_indices, system_matrix_row_indices + system_size)),
+                "system_matrix_column_indices": np.concatenate((system_matrix_column_indices, system_matrix_column_indices + system_size)),
+                "function_indices": _SURFACE_FUNC_LIST,
+            }
 
-            # Loss-induced vacuum noise entries for the noise matrix.
-            set_instructions(
-                noise_instructions,
-                node,
-                function_input_indices=np.array([[loss_position]]),
-                output_column_indices=noise_output_column_indices,
-                system_matrix_row_indices=noise_system_matrix_indices,
-                system_matrix_column_indices=noise_system_matrix_indices,
-                function_indices=[FUNCTIONS.index(loss_quantum_noise)],
-                system_size_for_sidebands=system_size,
-            )
+            loss_inp = np.zeros((1, 7), dtype=np.int32)
+            loss_inp[0, 0] = loss_position
+            noise_idx_2 = np.concatenate((noise_system_matrix_indices, noise_system_matrix_indices + system_size))
+            noise_instructions[node] = {
+                "function_input_indices": loss_inp,
+                "output_column_indices": sig_noise_output_column_indices,
+                "system_matrix_row_indices": noise_idx_2,
+                "system_matrix_column_indices": noise_idx_2,
+                "function_indices": _LOSS_NOISE_FUNC_LIST,
+            }
 
     # -----------------------------------------------------------------
     # Apply laser field modulations (needs final indices of both lasers and signals).
@@ -1041,9 +945,9 @@ def build(setup: Setup, as_jax: bool = True):
 
             target_property = setup.nodes[signal]["target_property"]
             if target_property == "amplitude":
-                function_indices.extend([FUNCTIONS.index(laser_amplitude_modulation), FUNCTIONS.index(laser_amplitude_modulation)])
+                function_indices.extend([_IDX_LASER_AMP_MOD, _IDX_LASER_AMP_MOD])
             elif target_property == "frequency":
-                function_indices.extend([FUNCTIONS.index(laser_frequency_modulation), FUNCTIONS.index(laser_frequency_modulation_lower)])
+                function_indices.extend([_IDX_LASER_FREQ_MOD, _IDX_LASER_FREQ_MOD_LOWER])
             else:
                 raise ValueError("Target property for laser modulation has to be either amplitude or frequency.")
 
@@ -1136,11 +1040,11 @@ def build(setup: Setup, as_jax: bool = True):
                 system_matrix_row_indices=system_matrix_row_indices,
                 system_matrix_column_indices=system_matrix_column_indices,
                 function_indices=[
-                    FUNCTIONS.index(susceptibility),
-                    FUNCTIONS.index(force_calculation_left),
-                    FUNCTIONS.index(force_calculation_right),
-                    FUNCTIONS.index(corrected_optomechanical_phase_left),
-                    FUNCTIONS.index(corrected_optomechanical_phase_right),
+                    _IDX_SUSCEPTIBILITY,
+                    _IDX_FORCE_LEFT,
+                    _IDX_FORCE_RIGHT,
+                    _IDX_OM_PHASE_LEFT,
+                    _IDX_OM_PHASE_RIGHT,
                 ],
                 carrier_indices=np.array(
                     [
@@ -1224,11 +1128,11 @@ def build(setup: Setup, as_jax: bool = True):
                 system_matrix_row_indices=system_matrix_row_indices,
                 system_matrix_column_indices=system_matrix_column_indices,
                 function_indices=[
-                    FUNCTIONS.index(susceptibility),
-                    FUNCTIONS.index(force_calculation_left),
-                    FUNCTIONS.index(force_calculation_right),
-                    FUNCTIONS.index(corrected_optomechanical_phase_left),
-                    FUNCTIONS.index(corrected_optomechanical_phase_right),
+                    _IDX_SUSCEPTIBILITY,
+                    _IDX_FORCE_LEFT,
+                    _IDX_FORCE_RIGHT,
+                    _IDX_OM_PHASE_LEFT,
+                    _IDX_OM_PHASE_RIGHT,
                 ],
                 carrier_indices=np.array(
                     [
@@ -1301,7 +1205,7 @@ def build(setup: Setup, as_jax: bool = True):
             output_column_indices=np.array([0, 0]),
             system_matrix_row_indices=np.array([source_input_index, target_input_index]),
             system_matrix_column_indices=np.array([target_output_index, source_output_index]),
-            function_indices=[FUNCTIONS.index(space)],
+            function_indices=[_IDX_SPACE],
         )
 
         # Signal run: update both sidebands. Lower sideband uses `space_lower`.
@@ -1332,7 +1236,7 @@ def build(setup: Setup, as_jax: bool = True):
                     source_output_index + system_size,
                 ]
             ),
-            function_indices=[FUNCTIONS.index(space), FUNCTIONS.index(space_lower)],
+            function_indices=[_IDX_SPACE, _IDX_SPACE_LOWER],
         )
 
         # Space strain signals inject into the signal connector columns.
@@ -1366,15 +1270,16 @@ def build(setup: Setup, as_jax: bool = True):
                 output_row_indices=np.repeat(np.arange(space_signal_number * 2), 2),
                 system_matrix_row_indices=system_matrix_row_indices,
                 system_matrix_column_indices=system_matrix_column_indices,
-                function_indices=[FUNCTIONS.index(space_modulation), FUNCTIONS.index(space_modulation_lower)] * space_signal_number,
+                function_indices=[_IDX_SPACE_MOD, _IDX_SPACE_MOD_LOWER] * space_signal_number,
                 carrier_indices=np.array([source_input_index, target_input_index, source_input_index, target_input_index] * space_signal_number),
                 carrier_row_indices=system_matrix_row_indices,
                 carrier_column_indices=system_matrix_column_indices,
             )
 
     # Insert carrier matrix into both sideband blocks of the signal matrix.
-    signal_matrix[:system_size, :system_size] = carrier_matrix[:, :system_size]
-    signal_matrix[system_size:-signal_size, system_size:-signal_size - 1] = carrier_matrix[:, :system_size]
+    if not _sparse_signal:
+        signal_matrix[:system_size, :system_size] = carrier_matrix[:, :system_size]
+        signal_matrix[system_size:-signal_size, system_size:-signal_size - 1] = carrier_matrix[:, :system_size]
 
     # -----------------------------------------------------------------
     # Mark unused ports and inject vacuum noise at those ports.
@@ -1389,16 +1294,14 @@ def build(setup: Setup, as_jax: bool = True):
         node_index = matrix_positions[node]
         port_index = node_index + port_offset
 
-        set_instructions(
-            noise_instructions,
-            node_port,
-            function_input_indices=np.array([[0]]),
-            output_column_indices=np.array([0]),
-            system_matrix_row_indices=np.array([port_index]),
-            system_matrix_column_indices=np.array([port_index]),
-            function_indices=[FUNCTIONS.index(vacuum_quantum_noise)],
-            system_size_for_sidebands=system_size,
-        )
+        port_pair = np.array([port_index, port_index + system_size], dtype=np.int32)
+        noise_instructions[node_port] = {
+            "function_input_indices": _VACUUM_INP_PADDED,
+            "output_column_indices": _VACUUM_OUT_COL_2,
+            "system_matrix_row_indices": port_pair,
+            "system_matrix_column_indices": port_pair,
+            "function_indices": _VACUUM_FUNC_LIST,
+        }
 
     # -----------------------------------------------------------------
     # Build port-to-index lookup for carrier ports.
@@ -1663,7 +1566,7 @@ def pairs_to_arrays(
             # Dummy update that leaves matrices unchanged.
             return (
                 jnp.array([[0, 0, 0]]),
-                jnp.array([FUNCTIONS.index(dummy_function)]),
+                jnp.array([_IDX_DUMMY]),
                 jnp.array([[0], [0]]),
                 jnp.array([[0], [0]]),
             )
@@ -1863,28 +1766,25 @@ _FUNCTION_USED_ARGS = (
 )
 
 
-def _pack_sparse_csc(base_matrix: np.ndarray, extra_rows: np.ndarray, extra_cols: np.ndarray):
-    """Build static CSC structure for an augmented (N, N + 1) matrix in pure NumPy.
-
-    Returns the base values, CSC metadata and sorted column-major keys.
-    RHS column entries (col == N or col == -1) map to flat positions [nnz_A, nnz_A + N).
-    """
-    n = base_matrix.shape[0]
-    base_A = base_matrix[:, :n]
-    base_r, base_c = np.nonzero(base_A)
-
+def _pack_sparse_csc_coo(
+    n: int,
+    base_r: np.ndarray,
+    base_c: np.ndarray,
+    base_v: np.ndarray,
+    base_rhs: np.ndarray | None,
+    extra_rows: np.ndarray,
+    extra_cols: np.ndarray,
+):
+    """Build static CSC structure directly from unique base COO entries + extra pattern."""
+    base_keys = base_c.astype(np.int64) * n + base_r.astype(np.int64)
     if len(extra_rows) > 0:
         norm_c = np.where(extra_cols < 0, n, extra_cols)
         mat_mask = norm_c < n
-        all_r = np.concatenate([base_r, extra_rows[mat_mask].astype(np.int64)])
-        all_c = np.concatenate([base_c, norm_c[mat_mask].astype(np.int64)])
+        extra_keys = norm_c[mat_mask].astype(np.int64) * n + extra_rows[mat_mask].astype(np.int64)
+        uniq_keys = np.unique(np.concatenate((base_keys, extra_keys)))
     else:
-        all_r = base_r.astype(np.int64)
-        all_c = base_c.astype(np.int64)
+        uniq_keys = np.unique(base_keys)
 
-    # Deduplicate (row, col) and sort into canonical CSC order (column-major, row-sorted)
-    keys = all_c * n + all_r
-    uniq_keys = np.unique(keys)
     csc_cols = (uniq_keys // n).astype(np.int32)
     csc_rows = (uniq_keys % n).astype(np.int32)
     nnz_A = len(csc_rows)
@@ -1895,11 +1795,21 @@ def _pack_sparse_csc(base_matrix: np.ndarray, extra_rows: np.ndarray, extra_cols
     csc_indptr[0] = 0
     np.cumsum(counts, out=csc_indptr[1:])
 
-    base_aug = np.empty(nnz_A + n, dtype=np.complex128)
-    base_aug[:nnz_A] = base_A[csc_rows, csc_cols]
-    base_aug[nnz_A:] = base_matrix[:, n]
+    base_aug = np.zeros(nnz_A + n, dtype=np.complex128)
+    if base_keys.size:
+        base_aug[np.searchsorted(uniq_keys, base_keys)] = base_v
+    if base_rhs is not None:
+        base_aug[nnz_A:] = base_rhs
 
     return base_aug, csc_rows, csc_cols, csc_indices, csc_indptr, uniq_keys, nnz_A
+
+
+def _pack_sparse_csc(base_matrix: np.ndarray, extra_rows: np.ndarray, extra_cols: np.ndarray):
+    """Build static CSC structure for an augmented (N, N + 1) matrix in pure NumPy."""
+    n = base_matrix.shape[0]
+    base_A = base_matrix[:, :n]
+    base_r, base_c = np.nonzero(base_A)
+    return _pack_sparse_csc_coo(n, base_r, base_c, base_A[base_r, base_c], base_matrix[:, n], extra_rows, extra_cols)
 
 
 def _map_rc_to_flat_pos(rows: np.ndarray, cols: np.ndarray, csc_keys: np.ndarray, nnz_A: int, n: int) -> np.ndarray:
@@ -1908,63 +1818,113 @@ def _map_rc_to_flat_pos(rows: np.ndarray, cols: np.ndarray, csc_keys: np.ndarray
     return np.where(rhs, nnz_A + rows, np.searchsorted(csc_keys, keys)).astype(np.int32)
 
 
+_FUNCTION_USED_ARGS_ARR = np.asarray(_FUNCTION_USED_ARGS, dtype=np.int32)
+_CONSTANT_FUNCS = frozenset((6, 7, 10))
+
+
 def _group_instructions_np(
     inp_indices: np.ndarray,
     func_indices: list[int],
     out_row: np.ndarray,
     out_col: np.ndarray,
     flat_pos: np.ndarray,
+    *,
     sweep_param_set: set[int] | None = None,
+    sweep_rows: np.ndarray | None = None,
+    static_sweep_set: set[int] | None = None,
+    bwd_map: np.ndarray | None = None,
 ):
-    """Partition component update calls by (is_sweep, func_idx) into NumPy tuples."""
-    static_buckets: dict[int, list[int]] = defaultdict(list)
-    sweep_buckets: dict[int, list[int]] = defaultdict(list)
+    """Partition component update calls by (is_sweep, func_idx) into _OpGroup objects."""
+    from differometor._sparse_kernel import build_op_group
 
-    for k, f_idx in enumerate(func_indices):
-        f_idx_int = int(f_idx)
-        is_sweep = False
-        if sweep_param_set:
-            used = _FUNCTION_USED_ARGS[f_idx_int]
-            if used > 0:
-                row_vals = inp_indices[k, :used]
-                for v in row_vals:
-                    if int(v) in sweep_param_set:
-                        is_sweep = True
-                        break
-        if is_sweep:
-            sweep_buckets[f_idx_int].append(k)
+    n_k = len(func_indices)
+    if n_k == 0 or flat_pos.size == 0:
+        return (), ()
+
+    f_arr = np.asarray(func_indices, dtype=np.int32)
+    if sweep_param_set:
+        used_arr = _FUNCTION_USED_ARGS_ARR[f_arr]
+        col_mask = np.arange(inp_indices.shape[1], dtype=np.int32)[None, :] < used_arr[:, None]
+        if len(sweep_param_set) == 1:
+            sw0 = next(iter(sweep_param_set))
+            is_sweep = np.any((inp_indices == sw0) & col_mask, axis=1)
         else:
-            static_buckets[f_idx_int].append(k)
+            sw_list = np.fromiter(sweep_param_set, dtype=inp_indices.dtype, count=len(sweep_param_set))
+            is_sweep = np.any(np.isin(inp_indices, sw_list) & col_mask, axis=1)
+    else:
+        is_sweep = np.zeros(n_k, dtype=bool)
 
-    row_to_scatter: dict[int, list[int]] = defaultdict(list)
-    for m, r in enumerate(out_row):
-        row_to_scatter[int(r)].append(m)
+    # Bucket id: 0..18 for static, 19..37 for sweep
+    bucket_id = f_arr + np.where(is_sweep, 19, 0)
+    k_order = np.argsort(bucket_id, kind="stable")
+    b_sorted = bucket_id[k_order]
+    b_changes = np.empty(n_k, dtype=bool)
+    b_changes[0] = True
+    b_changes[1:] = b_sorted[1:] != b_sorted[:-1]
+    b_starts = np.flatnonzero(b_changes)
+    b_ends = np.empty_like(b_starts)
+    b_ends[:-1] = b_starts[1:]
+    b_ends[-1] = n_k
+    uniq_buckets = b_sorted[b_starts]
 
-    def build_groups(buckets: dict[int, list[int]]):
-        groups = []
-        for f_idx_int, k_list in sorted(buckets.items()):
-            inp_sub = np.ascontiguousarray(inp_indices[k_list], dtype=np.int32)
-            local_out_rows = []
-            local_out_cols = []
-            local_flat_pos = []
-            for local_k, old_k in enumerate(k_list):
-                for m in row_to_scatter[old_k]:
-                    local_out_rows.append(local_k)
-                    local_out_cols.append(int(out_col[m]))
-                    local_flat_pos.append(int(flat_pos[m]))
-            if local_flat_pos:
-                n_out_cols = 3 if f_idx_int == 2 else (4 if f_idx_int == 17 else 1)
-                groups.append((
-                    f_idx_int,
-                    inp_sub,
-                    np.asarray(local_out_rows, dtype=np.int32),
-                    np.asarray(local_out_cols, dtype=np.int32),
-                    np.asarray(local_flat_pos, dtype=np.int32),
-                    n_out_cols,
-                ))
-        return tuple(groups)
+    # Map each old_k -> (bucket_slot, local_k)
+    old_k_to_slot = np.empty(n_k, dtype=np.intp)
+    old_k_to_local = np.empty(n_k, dtype=np.intp)
+    slot_k_lists = []
+    for slot_i, (s, e) in enumerate(zip(b_starts, b_ends)):
+        ks = k_order[s:e]
+        slot_k_lists.append(ks)
+        old_k_to_slot[ks] = slot_i
+        old_k_to_local[ks] = np.arange(e - s, dtype=np.intp)
 
-    return build_groups(static_buckets), build_groups(sweep_buckets)
+    # Group scatter entries by (slot, local_k) preserving original order within each local_k
+    m_slots = old_k_to_slot[out_row]
+    m_local = old_k_to_local[out_row]
+    m_key = m_slots * np.int64(n_k) + m_local
+    m_order = np.argsort(m_key, kind="stable")
+    m_slots_sorted = m_slots[m_order]
+    m_local_sorted = m_local[m_order]
+    m_out_col_sorted = out_col[m_order]
+    m_flat_pos_sorted = flat_pos[m_order]
+
+    slot_counts = np.bincount(m_slots_sorted, minlength=len(uniq_buckets))
+    slot_offsets = np.empty(len(uniq_buckets) + 1, dtype=np.intp)
+    slot_offsets[0] = 0
+    np.cumsum(slot_counts, out=slot_offsets[1:])
+
+    static_groups = []
+    sweep_groups = []
+    for slot_i, bid in enumerate(uniq_buckets):
+        ms = int(slot_offsets[slot_i])
+        me = int(slot_offsets[slot_i + 1])
+        if ms == me:
+            continue
+        bid_int = int(bid)
+        is_sw_bucket = bid_int >= 19
+        f_idx_int = bid_int - 19 if is_sw_bucket else bid_int
+        used = _FUNCTION_USED_ARGS[f_idx_int]
+        ks = slot_k_lists[slot_i]
+        inp_sub = np.ascontiguousarray(inp_indices[ks, :used], dtype=np.intp)
+        fp_slice = m_flat_pos_sorted[ms:me]
+        bwd_fp = bwd_map[fp_slice] if (bwd_map is not None and f_idx_int not in _CONSTANT_FUNCS) else None
+        n_out_cols = 3 if f_idx_int == 2 else (4 if f_idx_int == 17 else 1)
+        grp = build_op_group(
+            f_idx_int,
+            inp_sub,
+            m_local_sorted[ms:me],
+            m_out_col_sorted[ms:me],
+            fp_slice,
+            n_out_cols,
+            bwd_flat_pos=bwd_fp,
+            sweep_rows=sweep_rows if is_sw_bucket else None,
+            batch_sweep_set=sweep_param_set if is_sw_bucket else static_sweep_set,
+        )
+        if is_sw_bucket:
+            sweep_groups.append(grp)
+        else:
+            static_groups.append(grp)
+
+    return tuple(static_groups), tuple(sweep_groups)
 
 
 def build_sparse_simulation_arrays(
@@ -1975,9 +1935,9 @@ def build_sparse_simulation_arrays(
 ):
     """Build compact sparse CSC topology and minimal JAX arrays for `simulate`."""
     from differometor._sparse_kernel import SparseTopology
-    from differometor._sparse_blocks import plan_signal_blocks
+    from differometor._sparse_blocks import build_scatter_plan, plan_signal_blocks
 
-    instructions, matrices, metadata = build(setup, as_jax=False)
+    instructions, matrices, metadata = build(setup, as_jax=False, _sparse_signal=True)
     carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names = instructions
     (
         parameters_np,
@@ -2034,7 +1994,7 @@ def build_sparse_simulation_arrays(
         signal_arrays_raw["output_column_indices"].append(inst["output_column_indices"])
         if "output_row_indices" in inst:
             signal_arrays_raw["output_row_indices"].append(inst["output_row_indices"].flatten() + signal_component_number)
-            signal_component_number += len(np.unique(inst["output_row_indices"]))
+            signal_component_number += inst["function_input_indices"].shape[0]
         else:
             signal_arrays_raw["output_row_indices"].append(
                 np.full(len(inst["output_column_indices"]), signal_component_number, dtype=np.int32)
@@ -2094,7 +2054,15 @@ def build_sparse_simulation_arrays(
     else:
         signal_changing_values = empty_sweep
 
-    sig_ch_set = set(signal_changing_parameter_indices)
+    car_ch_idx_np = np.asarray(carrier_changing_parameter_indices, dtype=np.intp)
+    sig_ch_idx_np = np.asarray(signal_changing_parameter_indices, dtype=np.intp)
+    car_ch_set = set(carrier_changing_parameter_indices) if carrier_changing_parameter_indices else None
+    sig_ch_set = set(signal_changing_parameter_indices) if signal_changing_parameter_indices else None
+
+    sig_sweep_rows = None
+    if sig_ch_idx_np.size > 0:
+        sig_sweep_rows = np.full(parameters_np.shape[1], -1, dtype=np.intp)
+        sig_sweep_rows[sig_ch_idx_np] = np.arange(sig_ch_idx_np.size, dtype=np.intp)
 
     # --- Carrier CSC & grouped updates ---
     cn = carrier_matrix_np.shape[0]
@@ -2111,19 +2079,23 @@ def build_sparse_simulation_arrays(
         c_mat_r = np.zeros((0,), dtype=np.int32)
         c_mat_c = np.zeros((0,), dtype=np.int32)
 
-    c_base_aug, c_rows, c_cols, c_indices, c_indptr, c_keys, c_nnz = _pack_sparse_csc(
-        carrier_matrix_np, c_mat_r, c_mat_c
+    c_base_A = carrier_matrix_np[:, :cn]
+    c_base_r, c_base_c = np.nonzero(c_base_A)
+    c_base_v = c_base_A[c_base_r, c_base_c]
+    c_base_aug, c_rows, c_cols, c_indices, c_indptr, c_keys, c_nnz = _pack_sparse_csc_coo(
+        cn, c_base_r, c_base_c, c_base_v, carrier_matrix_np[:, cn], c_mat_r, c_mat_c
     )
     if len(c_mat_r) > 0:
         c_flat_pos = _map_rc_to_flat_pos(c_mat_r, c_mat_c, c_keys, c_nnz, cn)
         carrier_groups, _ = _group_instructions_np(
-            c_inp, carrier_arrays_raw["function_indices"], c_out_r, c_out_c, c_flat_pos, sweep_param_set=None
+            c_inp, carrier_arrays_raw["function_indices"], c_out_r, c_out_c, c_flat_pos,
+            sweep_param_set=None, static_sweep_set=car_ch_set,
         )
     else:
         carrier_groups = ()
 
-    # --- Signal CSC & grouped updates ---
-    sn = signal_matrix_np.shape[0]
+    # --- Signal CSC & grouped updates (built directly in COO, skipping dense sn x (sn+1)) ---
+    sn = int(signal_matrix_np)
     if len(signal_arrays_raw["function_input_indices"]) > 0:
         s_inp = np.vstack(signal_arrays_raw["function_input_indices"]).astype(np.int32)
         s_out_r = np.concatenate(signal_arrays_raw["output_row_indices"]).astype(np.int32)
@@ -2138,33 +2110,73 @@ def build_sparse_simulation_arrays(
         s_mat_c = np.zeros((0,), dtype=np.int32)
 
     if "carrier_indices" in signal_arrays_raw:
-        s_car_idx = np.concatenate(signal_arrays_raw["carrier_indices"]).astype(np.int32)
+        s_car_idx = np.concatenate(signal_arrays_raw["carrier_indices"]).astype(np.intp)
         s_car_r = np.concatenate(signal_arrays_raw["carrier_row_indices"]).astype(np.int32)
         s_car_c = np.concatenate(signal_arrays_raw["carrier_column_indices"]).astype(np.int32)
         extra_s_r = np.concatenate([s_mat_r, s_car_r]) if len(s_mat_r) > 0 else s_car_r
         extra_s_c = np.concatenate([s_mat_c, s_car_c]) if len(s_mat_c) > 0 else s_car_c
     else:
-        s_car_idx = np.zeros((0,), dtype=np.int32)
+        s_car_idx = np.zeros((0,), dtype=np.intp)
         s_car_r = np.zeros((0,), dtype=np.int32)
         s_car_c = np.zeros((0,), dtype=np.int32)
         extra_s_r = s_mat_r
         extra_s_c = s_mat_c
 
-    s_base_aug, s_rows, s_cols, s_indices, s_indptr, s_keys, s_nnz = _pack_sparse_csc(
-        signal_matrix_np, extra_s_r, extra_s_c
+    s_diag = np.arange(2 * cn, sn, dtype=np.int64)
+    s_base_r = np.concatenate((c_base_r, c_base_r + cn, s_diag))
+    s_base_c = np.concatenate((c_base_c, c_base_c + cn, s_diag))
+    s_base_v = np.concatenate((c_base_v, c_base_v, np.ones(s_diag.size, dtype=np.complex128)))
+    s_base_aug, s_rows, s_cols, s_indices, s_indptr, s_keys, s_nnz = _pack_sparse_csc_coo(
+        sn, s_base_r, s_base_c, s_base_v, None, extra_s_r, extra_s_c
     )
     if len(s_mat_r) > 0:
         s_flat_pos = _map_rc_to_flat_pos(s_mat_r, s_mat_c, s_keys, s_nnz, sn)
+    else:
+        s_flat_pos = np.zeros((0,), dtype=np.int32)
+
+    if len(s_car_idx) > 0:
+        s_car_flat_pos = _map_rc_to_flat_pos(s_car_r, s_car_c, s_keys, s_nnz, sn).astype(np.intp)
+    else:
+        s_car_flat_pos = np.zeros((0,), dtype=np.intp)
+
+    # Identify active backward signal slots (only non-constant groups + carrier couplings)
+    active_mask = np.zeros(s_nnz + sn, dtype=bool)
+    if s_car_flat_pos.size > 0:
+        active_mask[s_car_flat_pos] = True
+    if len(s_mat_r) > 0:
+        s_f_arr = np.asarray(signal_arrays_raw["function_indices"], dtype=np.int32)
+        nonconst_k = (s_f_arr != 6) & (s_f_arr != 7) & (s_f_arr != 10)
+        nonconst_m = nonconst_k[s_out_r]
+        if nonconst_m.any():
+            active_mask[s_flat_pos[nonconst_m]] = True
+
+    bwd_a_pos = np.flatnonzero(active_mask[:s_nnz])
+    bwd_rhs_rows = np.flatnonzero(active_mask[s_nnz:])
+    bwd_n_act_a = int(bwd_a_pos.size)
+    bwd_n_act = bwd_n_act_a + int(bwd_rhs_rows.size)
+    bwd_map = np.full(s_nnz + sn, -1, dtype=np.intp)
+    bwd_map[bwd_a_pos] = np.arange(bwd_n_act_a, dtype=np.intp)
+    bwd_map[s_nnz + bwd_rhs_rows] = np.arange(bwd_n_act_a, bwd_n_act, dtype=np.intp)
+
+    if len(s_mat_r) > 0:
         signal_groups_static, signal_groups_sweep = _group_instructions_np(
-            s_inp, signal_arrays_raw["function_indices"], s_out_r, s_out_c, s_flat_pos, sweep_param_set=sig_ch_set
+            s_inp, signal_arrays_raw["function_indices"], s_out_r, s_out_c, s_flat_pos,
+            sweep_param_set=sig_ch_set, sweep_rows=sig_sweep_rows,
+            static_sweep_set=car_ch_set, bwd_map=bwd_map,
         )
     else:
         signal_groups_static, signal_groups_sweep = (), ()
 
-    if len(s_car_idx) > 0:
-        s_car_flat_pos = _map_rc_to_flat_pos(s_car_r, s_car_c, s_keys, s_nnz, sn)
-    else:
-        s_car_flat_pos = np.zeros((0,), dtype=np.int32)
+    bwd_sig_car_pos = bwd_map[s_car_flat_pos] if s_car_flat_pos.size > 0 else np.zeros((0,), dtype=np.intp)
+
+    static_bwd_parts = [
+        bwd_map[g.flat_pos] for g in signal_groups_static if g.const_val is None
+    ]
+    bwd_sig_static_pos = (
+        np.unique(np.concatenate(static_bwd_parts)).astype(np.intp)
+        if static_bwd_parts
+        else np.zeros((0,), dtype=np.intp)
+    )
 
     s_unit_slots = s_base_aug == 1
     if len(s_mat_r):
@@ -2178,6 +2190,14 @@ def build_sparse_simulation_arrays(
         | ((s_rows >= cn) & (s_rows < 2 * cn) & (s_cols >= 2 * cn))
     )
     conj_mask[s_nnz + cn : s_nnz + 2 * cn] = True
+    sweep_written_mask = np.zeros(s_nnz + sn, dtype=bool)
+    if s_car_flat_pos.size > 0:
+        sweep_written_mask[s_car_flat_pos] = True
+    for g in signal_groups_sweep:
+        sweep_written_mask[g.flat_pos] = True
+    signal_static_conj_idx = np.flatnonzero(conj_mask & ~sweep_written_mask)
+    signal_sweep_conj_idx = np.flatnonzero(conj_mask & sweep_written_mask)
+    bwd_sig_conj_idx = bwd_map[np.flatnonzero(conj_mask & active_mask)]
 
     # --- Noise sparse COO & grouped updates ---
     if len(noise_arrays_raw["function_input_indices"]) > 0:
@@ -2191,8 +2211,8 @@ def build_sparse_simulation_arrays(
             n_mat_r.astype(np.int64) * sn + n_mat_c, return_index=True, return_inverse=True
         )
         in_write_order = np.argsort(first)
-        noise_rows = n_mat_r[first[in_write_order]]
-        noise_cols = n_mat_c[first[in_write_order]]
+        noise_rows = n_mat_r[first[in_write_order]].astype(np.intp)
+        noise_cols = n_mat_c[first[in_write_order]].astype(np.intp)
         n_flat_pos = np.argsort(in_write_order)[inverse].astype(np.int32)
         noise_base_vals = (
             noise_matrix_np[noise_rows, noise_cols].astype(np.complex128)
@@ -2200,11 +2220,12 @@ def build_sparse_simulation_arrays(
             else np.zeros(len(noise_rows), dtype=np.complex128)
         )
         noise_groups_static, noise_groups_sweep = _group_instructions_np(
-            n_inp, noise_arrays_raw["function_indices"], n_out_r, n_out_c, n_flat_pos, sweep_param_set=sig_ch_set
+            n_inp, noise_arrays_raw["function_indices"], n_out_r, n_out_c, n_flat_pos,
+            sweep_param_set=sig_ch_set, sweep_rows=sig_sweep_rows, static_sweep_set=car_ch_set,
         )
     else:
-        noise_rows = np.zeros((0,), dtype=np.int32)
-        noise_cols = np.zeros((0,), dtype=np.int32)
+        noise_rows = np.zeros((0,), dtype=np.intp)
+        noise_cols = np.zeros((0,), dtype=np.intp)
         noise_base_vals = np.zeros((0,), dtype=np.complex128)
         noise_groups_static, noise_groups_sweep = (), ()
 
@@ -2227,12 +2248,16 @@ def build_sparse_simulation_arrays(
         for fi, (srcs, dsts) in sorted(tmp_links.items()):
             linked_groups[fi] = (jnp.asarray(srcs, dtype=jnp.int32), jnp.asarray(dsts, dtype=jnp.int32))
 
-    opt_param_idx_np = np.asarray(optimized_parameter_indices, dtype=np.int32)
-    opt_val_idx_np = np.asarray(optimization_value_indices, dtype=np.int32)
+    opt_param_idx_np = np.asarray(optimized_parameter_indices, dtype=np.intp)
+    opt_val_idx_np = np.asarray(optimization_value_indices, dtype=np.intp)
     _, last_reversed = np.unique(opt_param_idx_np[::-1], return_index=True)
     opt_write_rows = np.sort(opt_param_idx_np.size - 1 - last_reversed)
     opt_param_idx_np = opt_param_idx_np[opt_write_rows]
     opt_val_idx_np = opt_val_idx_np[opt_write_rows]
+
+    s_rows_i64 = s_rows.astype(np.intp)
+    s_cols_i64 = s_cols.astype(np.intp)
+    qhd_param_idx_p = np.asarray(qhd_parameter_indices_np, dtype=np.intp)
 
     topology = SparseTopology(
         cn=cn,
@@ -2243,19 +2268,20 @@ def build_sparse_simulation_arrays(
         num_detectors=noise_selection_vectors_np.shape[0],
         opt_param_idx=opt_param_idx_np,
         opt_val_idx=opt_val_idx_np,
-        car_ch_idx=np.asarray(carrier_changing_parameter_indices, dtype=np.int32),
-        sig_ch_idx=np.asarray(signal_changing_parameter_indices, dtype=np.int32),
-        qhd_param_idx=qhd_parameter_indices_np,
+        car_ch_idx=car_ch_idx_np,
+        sig_ch_idx=sig_ch_idx_np,
+        qhd_param_idx=qhd_param_idx_p,
         qhd_placing_idx=qhd_placing_indices_np,
+        qhd_scatter_plan=build_scatter_plan(qhd_param_idx_p),
         carrier_base_aug=c_base_aug,
-        carrier_csc_rows=c_rows.astype(np.int64),
-        carrier_csc_cols=c_cols.astype(np.int64),
+        carrier_csc_rows=c_rows.astype(np.intp),
+        carrier_csc_cols=c_cols.astype(np.intp),
         carrier_csc_indices=c_indices,
         carrier_csc_indptr=c_indptr,
         carrier_groups=carrier_groups,
         signal_base_aug=s_base_aug,
-        signal_csc_rows=s_rows.astype(np.int64),
-        signal_csc_cols=s_cols.astype(np.int64),
+        signal_csc_rows=s_rows_i64,
+        signal_csc_cols=s_cols_i64,
         signal_csc_indices=s_indices,
         signal_csc_indptr=s_indptr,
         signal_block_plan=plan_signal_blocks(sn, s_rows, s_cols, unit_slots=s_unit_slots[:s_nnz]),
@@ -2263,7 +2289,17 @@ def build_sparse_simulation_arrays(
         signal_groups_sweep=signal_groups_sweep,
         signal_carrier_indices=s_car_idx,
         signal_carrier_flat_pos=s_car_flat_pos,
-        signal_conj_mask=conj_mask,
+        signal_carrier_scatter_plan=build_scatter_plan(s_car_idx),
+        signal_static_conj_idx=signal_static_conj_idx,
+        signal_sweep_conj_idx=signal_sweep_conj_idx,
+        bwd_sig_n_act=bwd_n_act,
+        bwd_sig_n_act_a=bwd_n_act_a,
+        bwd_sig_a_rows=s_rows_i64[bwd_a_pos],
+        bwd_sig_a_cols=s_cols_i64[bwd_a_pos],
+        bwd_sig_rhs_rows=bwd_rhs_rows,
+        bwd_sig_conj_idx=bwd_sig_conj_idx,
+        bwd_sig_car_pos=bwd_sig_car_pos,
+        bwd_sig_static_pos=bwd_sig_static_pos,
         noise_base_vals=noise_base_vals,
         noise_rows=noise_rows,
         noise_cols=noise_cols,
@@ -2290,4 +2326,3 @@ def build_sparse_simulation_arrays(
     }
 
     return simulation_arrays, metadata
-

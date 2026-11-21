@@ -1,22 +1,92 @@
 """Separate fixed-unit equations from an optical system's static CSC pattern."""
 
-from dataclasses import dataclass, replace
-
 import numpy as np
 
 
-@dataclass(frozen=True, slots=True)
+def build_scatter_plan(indices: np.ndarray):
+    """Group indices by per-target occurrence rank (exact np.add.at order).
+
+    Returns a tuple of ``(src_positions_or_None, dst_targets)`` pairs with
+    ``np.intp`` index arrays. When every target is unique, returns
+    ``((None, targets),)`` so callers can add without slicing updates.
+    """
+    idx = np.asarray(indices, dtype=np.intp)
+    if idx.size == 0:
+        return ()
+    order = np.argsort(idx, kind="stable")
+    ordered = idx[order]
+    first = np.empty(ordered.size, dtype=bool)
+    first[0] = True
+    first[1:] = ordered[1:] != ordered[:-1]
+    if first.all():
+        return ((None, idx),)
+    starts = np.maximum.accumulate(np.where(first, np.arange(ordered.size), 0))
+    rank = np.empty(idx.size, dtype=np.intp)
+    rank[order] = np.arange(ordered.size) - starts
+    max_rank = int(rank.max())
+    batches = []
+    for r in range(max_rank + 1):
+        pos = np.flatnonzero(rank == r)
+        batches.append((pos, idx[pos]))
+    return tuple(batches)
+
+
+def scatter_add_axis1(dst: np.ndarray, plan: tuple, updates: np.ndarray) -> None:
+    """Scatter-add ``updates`` into ``dst`` along axis 1 in exact ufunc.at order."""
+    if not plan:
+        return
+    if len(plan) == 1 and plan[0][0] is None:
+        dst[:, plan[0][1]] += updates
+        return
+    for pos, targets in plan:
+        dst[:, targets] += updates[:, pos]
+
+
+def scatter_add_1d(dst: np.ndarray, plan: tuple, updates: np.ndarray) -> None:
+    """Scatter-add 1-D ``updates`` into 1-D ``dst`` in exact ufunc.at order."""
+    if not plan:
+        return
+    if len(plan) == 1 and plan[0][0] is None:
+        dst[plan[0][1]] += updates
+        return
+    for pos, targets in plan:
+        dst[targets] += updates[pos]
+
+
+def scatter_add_axis0_T(dst: np.ndarray, plan: tuple, updates: np.ndarray) -> None:
+    """Scatter-add ``updates.T`` (shape ``(M, B)``) into ``dst`` along axis 0."""
+    if not plan:
+        return
+    if len(plan) == 1 and plan[0][0] is None:
+        dst[plan[0][1]] += updates.T
+        return
+    for pos, targets in plan:
+        dst[targets] += updates[:, pos].T
+
+
 class _SingletonLayer:
-    coupling_slots: np.ndarray
-    sources: np.ndarray
-    targets: np.ndarray
+    __slots__ = ("coupling_slice", "sources", "targets", "target_plan", "source_plan")
+
+    def __init__(self, coupling_slice, sources, targets):
+        self.coupling_slice = coupling_slice
+        self.sources = np.asarray(sources, dtype=np.intp)
+        self.targets = np.asarray(targets, dtype=np.intp)
+        self.target_plan = build_scatter_plan(self.targets)
+        self.source_plan = build_scatter_plan(self.sources)
 
 
-def _scale_for_rhs(values, rhs):
-    return values[..., None] if rhs.ndim == 3 else values
+def _apply_step(couplings, sl, source, target_plan, buf):
+    if source.size == 0:
+        return
+    coeff = couplings[:, sl]
+    updates = buf[:, source]
+    if buf.ndim == 2:
+        np.multiply(coeff, updates, out=updates)
+    else:
+        np.multiply(coeff[:, :, None], updates, out=updates)
+    scatter_add_axis1(buf, target_plan, updates)
 
 
-@dataclass(frozen=True, slots=True)
 class _OpticalLinks:
     """Eliminate independent unit-diagonal rows with one incoming coefficient.
 
@@ -25,97 +95,155 @@ class _OpticalLinks:
     coefficients recover the original solution for normal and adjoint solves.
     """
 
-    variables: np.ndarray
-    predecessors: np.ndarray
-    incoming: np.ndarray
-    targets: np.ndarray
-    outgoing_variables: np.ndarray
-    outgoing: np.ndarray
-    raw_outgoing: np.ndarray
-    incoming_for_edge: np.ndarray
-    base_slots: np.ndarray
-    base_destinations: np.ndarray
-    corrections: np.ndarray
+    __slots__ = (
+        "variables",
+        "predecessors",
+        "incoming_slice",
+        "targets",
+        "outgoing_variables",
+        "outgoing_slice",
+        "raw_outgoing",
+        "incoming_for_edge",
+        "base_slots",
+        "base_destinations",
+        "fill_only_destinations",
+        "correction_plan",
+        "target_plan",
+        "predecessor_plan",
+        "variable_plan",
+        "outgoing_variable_plan",
+    )
+
+    def __init__(
+        self,
+        variables,
+        predecessors,
+        incoming_slice,
+        targets,
+        outgoing_variables,
+        outgoing_slice,
+        raw_outgoing,
+        incoming_for_edge,
+        base_slots,
+        base_destinations,
+        corrections,
+    ):
+        self.variables = np.asarray(variables, dtype=np.intp)
+        self.predecessors = np.asarray(predecessors, dtype=np.intp)
+        self.incoming_slice = incoming_slice
+        self.targets = np.asarray(targets, dtype=np.intp)
+        self.outgoing_variables = np.asarray(outgoing_variables, dtype=np.intp)
+        self.outgoing_slice = outgoing_slice
+        self.raw_outgoing = np.asarray(raw_outgoing, dtype=np.intp)
+        self.incoming_for_edge = np.asarray(incoming_for_edge, dtype=np.intp)
+        self.base_slots = np.asarray(base_slots, dtype=np.intp)
+        self.base_destinations = np.asarray(base_destinations, dtype=np.intp)
+        corr_idx = np.asarray(corrections, dtype=np.intp)
+        self.fill_only_destinations = np.setdiff1d(corr_idx, self.base_destinations).astype(np.intp)
+        self.correction_plan = build_scatter_plan(corr_idx)
+        self.target_plan = build_scatter_plan(self.targets)
+        self.predecessor_plan = build_scatter_plan(self.predecessors)
+        self.variable_plan = build_scatter_plan(self.variables)
+        self.outgoing_variable_plan = build_scatter_plan(self.outgoing_variables)
 
     def condense(self, values, matrix):
-        matrix.fill(0)
+        if self.fill_only_destinations.size:
+            matrix[:, self.fill_only_destinations] = 0
         matrix[:, self.base_destinations] = values[:, self.base_slots]
-        correction = -values[:, self.raw_outgoing] * values[:, self.incoming_for_edge]
-        np.add.at(matrix, (slice(None), self.corrections), correction)
+        if self.raw_outgoing.size:
+            correction = values[:, self.raw_outgoing]
+            np.negative(correction, out=correction)
+            correction *= values[:, self.incoming_for_edge]
+            scatter_add_axis1(matrix, self.correction_plan, correction)
 
-    def prepare(self, values, result, trans):
+    def prepare(self, couplings, buf, trans):
         if trans == "N":
-            source, target, slots = self.outgoing_variables, self.targets, self.outgoing
+            _apply_step(couplings, self.outgoing_slice, self.outgoing_variables, self.target_plan, buf)
         else:
-            source, target, slots = self.variables, self.predecessors, self.incoming
-        coefficients = values[:, slots]
-        if trans == "H":
-            coefficients = coefficients.conj()
-        updates = -_scale_for_rhs(coefficients, result) * result[:, source]
-        np.add.at(result, (slice(None), target), updates)
+            _apply_step(couplings, self.incoming_slice, self.variables, self.predecessor_plan, buf)
 
-    def restore(self, values, result, trans):
+    def restore(self, couplings, buf, trans):
         if trans == "N":
-            source, target, slots = self.predecessors, self.variables, self.incoming
+            _apply_step(couplings, self.incoming_slice, self.predecessors, self.variable_plan, buf)
         else:
-            source, target, slots = self.targets, self.outgoing_variables, self.outgoing
-        coefficients = values[:, slots]
-        if trans == "H":
-            coefficients = coefficients.conj()
-        updates = -_scale_for_rhs(coefficients, result) * result[:, source]
-        np.add.at(result, (slice(None), target), updates)
+            _apply_step(couplings, self.outgoing_slice, self.targets, self.outgoing_variable_plan, buf)
 
 
-@dataclass(frozen=True, slots=True)
 class SignalBlockPlan:
     """Order singleton substitutions around the remaining coupled block."""
 
-    leading: tuple[_SingletonLayer, ...]
-    trailing: tuple[_SingletonLayer, ...]
-    core: np.ndarray
-    rows: np.ndarray
-    indptr: np.ndarray
-    base_slots: np.ndarray
-    coupling_slots: np.ndarray
-    links: _OpticalLinks | None
+    __slots__ = (
+        "leading",
+        "trailing",
+        "core",
+        "rows",
+        "indptr",
+        "base_slots",
+        "coupling_slots",
+        "links",
+        "buffer_size",
+        "_tail_offset",
+        "_split_offset",
+    )
 
-    @property
-    def buffer_size(self):
-        return self.rows.size + self.coupling_slots.size
+    def __init__(self, leading, trailing, core, rows, indptr, base_slots, coupling_slots, links, split_offset):
+        self.leading = leading
+        self.trailing = trailing
+        self.core = np.asarray(core, dtype=np.intp)
+        self.rows = rows
+        self.indptr = indptr
+        self.base_slots = np.asarray(base_slots, dtype=np.intp)
+        self.coupling_slots = np.asarray(coupling_slots, dtype=np.intp)
+        self.links = links
+        self._tail_offset = int(rows.size)
+        self._split_offset = int(split_offset)
+        self.buffer_size = self._tail_offset + int(self.coupling_slots.size)
 
     def pack(self, values):
         numeric = np.empty((values.shape[0], self.buffer_size), dtype=values.dtype)
-        core_matrix = numeric[:, :self.rows.size]
+        tail_offset = self._tail_offset
+        core_matrix = numeric[:, :tail_offset]
         if self.links is None:
             core_matrix[:] = values[:, self.base_slots]
         else:
             self.links.condense(values, core_matrix)
-        numeric[:, self.rows.size:] = values[:, self.coupling_slots]
+        # Pre-negate packed couplings once; every prepare/restore step multiplies by -coupling.
+        np.negative(values[:, self.coupling_slots], out=numeric[:, tail_offset:])
         return numeric
 
     def prepare(self, values, rhs, trans):
         result = rhs.copy()
-        layers = self.leading if trans == "N" else self.trailing
-        for layer in layers:
-            coupling = values[:, layer.coupling_slots]
-            if trans == "H":
-                coupling = coupling.conj()
-            updates = -_scale_for_rhs(coupling, rhs) * result[:, layer.sources]
-            np.add.at(result, (slice(None), layer.targets), updates)
-        if self.links is not None:
-            self.links.prepare(values, result, trans)
+        buf = result[:, :, 0] if (result.ndim == 3 and result.shape[2] == 1) else result
+        if trans == "N":
+            couplings = values[:, self._tail_offset : self._tail_offset + self._split_offset]
+            for layer in self.leading:
+                _apply_step(couplings, layer.coupling_slice, layer.sources, layer.target_plan, buf)
+            if self.links is not None:
+                self.links.prepare(couplings, buf, trans)
+        else:
+            half = values[:, self._tail_offset + self._split_offset :]
+            couplings = half.conj() if trans == "H" else half
+            for layer in self.trailing:
+                _apply_step(couplings, layer.coupling_slice, layer.sources, layer.target_plan, buf)
+            if self.links is not None:
+                self.links.prepare(couplings, buf, trans)
         return result
 
     def restore(self, values, result, trans):
-        if self.links is not None:
-            self.links.restore(values, result, trans)
-        layers = self.trailing if trans == "N" else self.leading
-        for layer in reversed(layers):
-            coupling = values[:, layer.coupling_slots]
-            if trans == "H":
-                coupling = coupling.conj()
-            updates = -_scale_for_rhs(coupling, result) * result[:, layer.targets]
-            np.add.at(result, (slice(None), layer.sources), updates)
+        buf = result[:, :, 0] if (result.ndim == 3 and result.shape[2] == 1) else result
+        if trans == "N":
+            couplings = values[:, self._tail_offset + self._split_offset :]
+            if self.links is not None:
+                self.links.restore(couplings, buf, trans)
+            for layer in reversed(self.trailing):
+                _apply_step(couplings, layer.coupling_slice, layer.targets, layer.source_plan, buf)
+        else:
+            half = values[:, self._tail_offset : self._tail_offset + self._split_offset]
+            couplings = half.conj() if trans == "H" else half
+            if self.links is not None:
+                self.links.restore(couplings, buf, trans)
+            for layer in reversed(self.leading):
+                _apply_step(couplings, layer.coupling_slice, layer.targets, layer.source_plan, buf)
 
 
 def plan_signal_blocks(size, rows, cols, *, unit_slots):
@@ -135,36 +263,68 @@ def plan_signal_blocks(size, rows, cols, *, unit_slots):
             peelable = active & unit_diagonal & (incoming == 0)
             direct = np.flatnonzero(peelable)
             if direct.size == 0:
-                return tuple(layers)
+                return layers
             coupling = edges & peelable[source]
-            layers.append(
-                _SingletonLayer(np.flatnonzero(coupling), source[coupling], target[coupling])
-            )
+            layers.append((np.flatnonzero(coupling), source[coupling], target[coupling]))
             active[direct] = False
 
-    leading = peel(cols, rows)
-    trailing = peel(rows, cols)
-    links, core, factored_rows, pointers, base_slots = _plan_optical_links(
+    raw_leading = peel(cols, rows)
+    raw_trailing = peel(rows, cols)
+    raw_links, core, factored_rows, pointers, base_slots = _plan_optical_links(
         size, rows, cols, diagonal, active, unit_diagonal
     )
-    if not (leading or trailing or links is not None):
+    if not (raw_leading or raw_trailing or raw_links is not None):
         return None
 
-    used = [layer.coupling_slots for layer in (*leading, *trailing)]
-    if links is not None:
-        used.extend((links.incoming, links.outgoing))
-    couplings = np.unique(np.concatenate(used))
-    packed = np.empty(rows.size, dtype=np.intp)
-    packed[couplings] = factored_rows.size + np.arange(couplings.size)
+    # Pack into two disjoint halves:
+    #   Half A (offset 0..split): leading layers + links.outgoing  (used by prepare("N") and restore("T"/"H"))
+    #   Half B (offset 0..end-split relative): trailing layers + links.incoming (used by prepare("T"/"H") and restore("N"))
+    half_a_parts = []
+    off_a = 0
+    leading_list = []
+    for slots, src, dst in raw_leading:
+        n = int(slots.size)
+        half_a_parts.append(slots)
+        leading_list.append(_SingletonLayer(slice(off_a, off_a + n), src, dst))
+        off_a += n
+    leading = tuple(leading_list)
 
-    def packed_layers(layers):
-        return tuple(replace(layer, coupling_slots=packed[layer.coupling_slots]) for layer in layers)
+    half_b_parts = []
+    off_b = 0
+    trailing_list = []
+    for slots, src, dst in raw_trailing:
+        n = int(slots.size)
+        half_b_parts.append(slots)
+        trailing_list.append(_SingletonLayer(slice(off_b, off_b + n), src, dst))
+        off_b += n
+    trailing = tuple(trailing_list)
 
-    if links is not None:
-        links = replace(links, incoming=packed[links.incoming], outgoing=packed[links.outgoing])
-    return SignalBlockPlan(
-        packed_layers(leading), packed_layers(trailing), core, factored_rows, pointers, base_slots, couplings, links
-    )
+    links = None
+    if raw_links is not None:
+        (
+            variables, predecessors, incoming_slots,
+            target, source, edge_slots,
+            incoming_for_edge, link_base_slots, base_dest, fill_dest,
+        ) = raw_links
+        n_out = int(edge_slots.size)
+        out_slice = slice(off_a, off_a + n_out)
+        half_a_parts.append(edge_slots)
+        off_a += n_out
+
+        n_in = int(incoming_slots.size)
+        in_slice = slice(off_b, off_b + n_in)
+        half_b_parts.append(incoming_slots)
+        off_b += n_in
+
+        links = _OpticalLinks(
+            variables, predecessors, in_slice,
+            target, source, out_slice,
+            edge_slots, incoming_for_edge, link_base_slots, base_dest, fill_dest,
+        )
+
+    all_parts = half_a_parts + half_b_parts
+    couplings = np.concatenate(all_parts).astype(np.intp, copy=False) if all_parts else np.empty(0, dtype=np.intp)
+    return SignalBlockPlan(leading, trailing, core, factored_rows, pointers, base_slots, couplings, links, off_a)
 
 
 def _plan_optical_links(size, rows, cols, diagonal, active, unit_diagonal):
@@ -194,7 +354,7 @@ def _plan_optical_links(size, rows, cols, diagonal, active, unit_diagonal):
     remap = np.cumsum(kept, dtype=np.int32) - 1
     base_slots = np.flatnonzero(kept[rows] & kept[cols])
     base_keys = remap[cols[base_slots]] * np.int64(core.size) + remap[rows[base_slots]]
-    link_plan = None
+    raw_links = None
     keys = base_keys
     if np.any(eliminate):
         variables = np.flatnonzero(eliminate)
@@ -203,9 +363,10 @@ def _plan_optical_links(size, rows, cols, diagonal, active, unit_diagonal):
         source = cols[edge_slots]
         fill_keys = remap[predecessor[source]] * np.int64(core.size) + remap[target]
         keys = np.union1d(base_keys, fill_keys)
-        link_plan = _OpticalLinks(
+        raw_links = (
             variables, predecessor[variables], incoming[variables],
-            target, source, edge_slots, edge_slots, incoming[source], base_slots,
+            target, source, edge_slots,
+            incoming[source], base_slots,
             np.searchsorted(keys, base_keys), np.searchsorted(keys, fill_keys),
         )
 
@@ -214,4 +375,4 @@ def _plan_optical_links(size, rows, cols, diagonal, active, unit_diagonal):
     pointers = np.empty(core.size + 1, dtype=np.int32)
     pointers[0] = 0
     np.cumsum(counts, out=pointers[1:])
-    return link_plan, core, factored_rows, pointers, base_slots
+    return raw_links, core, factored_rows, pointers, base_slots

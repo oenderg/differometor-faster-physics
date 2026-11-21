@@ -13,7 +13,6 @@ This module implements:
 from __future__ import annotations
 
 from importlib.machinery import EXTENSION_SUFFIXES
-from importlib.metadata import version
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from threading import Lock
@@ -44,12 +43,16 @@ _NOISE_SCALE = 2.0 * UNIT_VACUUM * H_PLANCK * F0 * 0.25
 def _load_pinned_superlu():
     """Load the pinned wheel's native solver without eagerly importing SciPy sparse."""
     try:
-        if version("scipy") != "1.18.1":
-            return None
         scipy = find_spec("scipy")
         if scipy is None or scipy.origin is None:
             return None
-        directory = Path(scipy.origin).parent / "sparse" / "linalg" / "_dsolve"
+        package = Path(scipy.origin).parent
+        # Same check as importlib.metadata.version("scipy") == "1.18.1" for a pip install,
+        # without scanning every distribution on sys.path (~1.5 ms). Other layouts fall back
+        # to the public SciPy import, which gives bit-identical results.
+        if not (package.parent / "scipy-1.18.1.dist-info").is_dir():
+            return None
+        directory = package / "sparse" / "linalg" / "_dsolve"
         for suffix in EXTENSION_SUFFIXES:
             binary = directory / f"_superlu{suffix}"
             if binary.is_file():
@@ -294,8 +297,15 @@ def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, seco
 
 
 # -----------------------------------------------------------------------------
-# Helper geometry / angle derivatives (real float64)
+# Area C: Scatter helpers, grouped component assembly, and analytical VJP
 # -----------------------------------------------------------------------------
+
+from differometor._sparse_blocks import (
+    build_scatter_plan,
+    scatter_add_1d,
+    scatter_add_axis1,
+)
+
 
 def _cos_beta(alpha_deg, n_l, n_r):
     return np.cos(np.arcsin((n_l * (1.0 / n_r)) * np.sin(alpha_deg * _DEG)))
@@ -310,7 +320,6 @@ def _cos_beta_and_derivs(alpha_deg, n_l, n_r):
     u = (n_l * inv_nr) * sin_a
     beta = np.arcsin(u)
     cos_b = np.cos(beta)
-    # d(cos(arcsin(u)))/du = -u / cos(beta)
     dcb_du = -u / cos_b
     d_alpha = dcb_du * (n_l * inv_nr * cos_a * _DEG)
     d_nl = dcb_du * (sin_a * inv_nr)
@@ -320,23 +329,23 @@ def _cos_beta_and_derivs(alpha_deg, n_l, n_r):
 
 # -----------------------------------------------------------------------------
 # Vectorized NumPy forward evaluators (indices 0..18 aligned with FUNCTIONS)
-# Input p: float64 shape (B, K, 7) -> Output y: complex128 shape (B, K, C)
+# Inputs: tuple of used parameter arrays, each shape (B, K) or (1, K) float64.
+# Outputs: complex128 shape (B_eff, K) for C=1, or (B_eff, K*C) for C>1.
 # -----------------------------------------------------------------------------
 
-def _fwd_0(p):  # force_calculation_right
-    cos_b = _cos_beta(p[..., 0], p[..., 1], p[..., 2])
-    return (cos_b * _INV_CX).astype(np.complex128)[..., None]
+def _fwd_0(args):  # force_calculation_right
+    alpha, n_l, n_r = args
+    return (_cos_beta(alpha, n_l, n_r) * _INV_CX).astype(np.complex128)
 
 
-def _fwd_1(p):  # laser
-    amp = np.sqrt(2.0 * p[..., 0] / EPSILON_0C)
-    return (amp * np.exp(1j * (p[..., 1] * _DEG)))[..., None]
+def _fwd_1(args):  # laser
+    power, phase = args
+    amp = np.sqrt(2.0 * power / EPSILON_0C)
+    return amp * np.exp(1j * (phase * _DEG))
 
 
-def _fwd_2(p):  # surface
-    loss, r_frac, tuning, freq, n_l, n_r, alpha = (
-        p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5], p[..., 6]
-    )
+def _fwd_2(args):  # surface
+    loss, r_frac, tuning, freq, n_l, n_r, alpha = args
     abs_r = (1.0 - loss) * r_frac
     abs_t = (1.0 - loss) * (1.0 - r_frac)
     t_scale = 2.0 * (tuning * _DEG) * (1.0 + freq * _INV_F0)
@@ -347,147 +356,154 @@ def _fwd_2(p):  # surface
     cr_r = _cos_beta(alpha, n_r, n_l)
     sqrt_r = np.sqrt(abs_r)
     sqrt_t = np.sqrt(abs_t)
-    r_l = -sqrt_r * np.exp(1j * (ps_l * cl))
-    t_val = -sqrt_t * np.exp(1j * (0.5 * np.pi + 0.5 * (ps_l * cl - ps_r * cr_t)))
+    ps_l_cl = ps_l * cl
+    r_l = -sqrt_r * np.exp(1j * ps_l_cl)
+    t_val = -sqrt_t * np.exp(1j * (0.5 * np.pi + 0.5 * (ps_l_cl - ps_r * cr_t)))
     r_r = -sqrt_r * np.exp(-1j * (ps_r * cr_r))
-    return np.stack([r_l, t_val, r_r], axis=-1)
+    b_eff = max(r_l.shape[0], t_val.shape[0], r_r.shape[0]); k = r_l.shape[1]
+    out = np.empty((b_eff, k, 3), dtype=np.complex128)
+    out[:, :, 0] = r_l
+    out[:, :, 1] = t_val
+    out[:, :, 2] = r_r
+    return out.reshape(b_eff, k * 3)
 
 
-def _fwd_3(p):  # space
-    theta = -_TWO_PI * p[..., 0] * p[..., 1] * p[..., 2] * _INV_C
-    return (-np.exp(1j * theta))[..., None]
+def _fwd_3(args):  # space
+    p0, p1, p2 = args
+    theta = -_TWO_PI * p0 * p1 * p2 * _INV_C
+    return -np.exp(1j * theta)
 
 
-def _fwd_4(p):  # space_modulation
-    w_g = _TWO_PI * p[..., 0]
+def _fwd_4(args):  # space_modulation
+    p0, p1, p2 = args
+    w_g = _TWO_PI * p0
     w_0 = _TWO_PI * F0
-    arg = w_g * p[..., 1] * p[..., 2] * (0.5 * _INV_C)
+    arg = w_g * p1 * p2 * (0.5 * _INV_C)
     m_g = -0.5 * (w_0 / w_g) * np.sin(arg)
-    return (1j * m_g * np.exp(-1j * arg))[..., None]
+    return 1j * m_g * np.exp(-1j * arg)
 
 
-def _fwd_5(p):  # signal_function
-    return (p[..., 0] * np.exp(1j * (p[..., 1] * _DEG)))[..., None]
+def _fwd_5(args):  # signal_function
+    p0, p1 = args
+    return p0 * np.exp(1j * (p1 * _DEG))
 
 
-def _fwd_6(p):  # dummy_function
-    return np.ones(p.shape[:-1] + (1,), dtype=np.complex128)
+def _fwd_8(args):  # loss_quantum_noise
+    (p0,) = args
+    return (p0 * 0.5).astype(np.complex128)
 
 
-def _fwd_7(p):  # vacuum_quantum_noise
-    return np.full(p.shape[:-1] + (1,), UNIT_VACUUM * 0.5, dtype=np.complex128)
+def _fwd_9(args):  # space_lower
+    p0, p1, p2 = args
+    theta = _TWO_PI * p0 * p1 * p2 * _INV_C
+    return -np.exp(1j * theta)
 
 
-def _fwd_8(p):  # loss_quantum_noise
-    return (p[..., 0] * 0.5).astype(np.complex128)[..., None]
+def _fwd_11(args):  # laser_frequency_modulation
+    (p0,) = args
+    return (EPSILON_0C * 0.5 / p0).astype(np.complex128)
 
 
-def _fwd_9(p):  # space_lower
-    theta = _TWO_PI * p[..., 0] * p[..., 1] * p[..., 2] * _INV_C
-    return (-np.exp(1j * theta))[..., None]
+def _fwd_12(args):  # susceptibility
+    p0, p1 = args
+    w = _TWO_PI * p0
+    return (1.0 / (p1 * w * w)).astype(np.complex128)
 
 
-def _fwd_10(p):  # laser_amplitude_modulation
-    return np.full(p.shape[:-1] + (1,), EPSILON_0C * 0.5, dtype=np.complex128)
+def _fwd_13(args):  # force_calculation_left
+    (p0,) = args
+    return (-np.cos(p0 * _DEG) * _INV_CX).astype(np.complex128)
 
 
-def _fwd_11(p):  # laser_frequency_modulation
-    return (EPSILON_0C * 0.5 / p[..., 0]).astype(np.complex128)[..., None]
-
-
-def _fwd_12(p):  # susceptibility
-    w = _TWO_PI * p[..., 0]
-    return (1.0 / (p[..., 1] * w * w)).astype(np.complex128)[..., None]
-
-
-def _fwd_13(p):  # force_calculation_left
-    return (-np.cos(p[..., 0] * _DEG) * _INV_CX).astype(np.complex128)[..., None]
-
-
-def _fwd_14(p):  # corrected_optomechanical_phase_left
-    freq, tuning, r_frac, loss, n_l, alpha = (
-        p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5]
-    )
+def _fwd_14(args):  # corrected_optomechanical_phase_left
+    freq, tuning, r_frac, loss, n_l, alpha = args
     abs_r = (1.0 - loss) * r_frac
     cl = np.cos(alpha * _DEG)
     t_rad = tuning * _DEG
     phase = t_rad * (freq * _INV_F0) + 2.0 * t_rad * n_l * (1.0 + freq * _INV_F0) * cl
-    return (1j * _Z_SCALE * cl * np.sqrt(abs_r) * np.exp(1j * phase))[..., None]
+    return 1j * _Z_SCALE * cl * np.sqrt(abs_r) * np.exp(1j * phase)
 
 
-def _fwd_15(p):  # corrected_optomechanical_phase_right
-    freq, tuning, r_frac, loss, n_l, n_r, alpha = (
-        p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5], p[..., 6]
-    )
+def _fwd_15(args):  # corrected_optomechanical_phase_right
+    freq, tuning, r_frac, loss, n_l, n_r, alpha = args
     abs_r = (1.0 - loss) * r_frac
     cr_om = _cos_beta(alpha, n_l, n_r)
     cr_rf = _cos_beta(alpha, n_r, n_l)
     t_rad = tuning * _DEG
     phase = -t_rad * (freq * _INV_F0) - 2.0 * t_rad * n_r * (1.0 + freq * _INV_F0) * cr_rf
-    return (-1j * _Z_SCALE * cr_om * np.sqrt(abs_r) * np.exp(1j * phase))[..., None]
+    return -1j * _Z_SCALE * cr_om * np.sqrt(abs_r) * np.exp(1j * phase)
 
 
-def _fwd_16(p):  # space_modulation_lower
-    w_g = -_TWO_PI * p[..., 0]
+def _fwd_16(args):  # space_modulation_lower
+    p0, p1, p2 = args
+    w_g = -_TWO_PI * p0
     w_0 = _TWO_PI * F0
-    arg = w_g * p[..., 1] * p[..., 2] * (0.5 * _INV_C)
+    arg = w_g * p1 * p2 * (0.5 * _INV_C)
     m_g = -0.5 * (w_0 / w_g) * np.sin(arg)
-    return (1j * m_g * np.exp(-1j * arg))[..., None]
+    return 1j * m_g * np.exp(-1j * arg)
 
 
-def _fwd_17(p):  # squeezer
+def _fwd_17(args):  # squeezer
+    p0, p1 = args
     vu = UNIT_VACUUM * 0.5
-    two_s = (2.0 * _SQ_K) * p[..., 0]
-    ph = np.exp(1j * (2.0 * _DEG) * p[..., 1])
+    two_s = (2.0 * _SQ_K) * p0
+    ph = np.exp(1j * (2.0 * _DEG) * p1)
     u_d = (vu * np.cosh(two_s)).astype(np.complex128)
     u_o = (vu * np.sinh(two_s)) * ph
-    return np.stack([u_d, u_o, u_d, np.conj(u_o)], axis=-1)
+    b_eff, k = u_o.shape
+    out = np.empty((b_eff, k, 4), dtype=np.complex128)
+    out[:, :, 0] = u_d
+    out[:, :, 1] = u_o
+    out[:, :, 2] = u_d
+    out[:, :, 3] = np.conj(u_o)
+    return out.reshape(b_eff, k * 4)
 
 
-def _fwd_18(p):  # laser_frequency_modulation_lower
-    return (-EPSILON_0C * 0.5 / p[..., 0]).astype(np.complex128)[..., None]
+def _fwd_18(args):  # laser_frequency_modulation_lower
+    (p0,) = args
+    return (-EPSILON_0C * 0.5 / p0).astype(np.complex128)
 
+
+NP_CONST_VALUES = {
+    6: complex(1.0),
+    7: complex(UNIT_VACUUM * 0.5),
+    10: complex(EPSILON_0C * 0.5),
+}
 
 NP_FWD_FUNCTIONS = (
-    _fwd_0, _fwd_1, _fwd_2, _fwd_3, _fwd_4, _fwd_5, _fwd_6, _fwd_7, _fwd_8,
-    _fwd_9, _fwd_10, _fwd_11, _fwd_12, _fwd_13, _fwd_14, _fwd_15, _fwd_16,
+    _fwd_0, _fwd_1, _fwd_2, _fwd_3, _fwd_4, _fwd_5, None, None, _fwd_8,
+    _fwd_9, None, _fwd_11, _fwd_12, _fwd_13, _fwd_14, _fwd_15, _fwd_16,
     _fwd_17, _fwd_18,
 )
 
 
 # -----------------------------------------------------------------------------
 # Exact analytical reverse-mode VJPs (indices 0..18 aligned with FUNCTIONS)
-# Inputs: p (B, K, 7) float64, gy (B, K, C) complex128
-# Output: gp (B, K, 7) float64  (only used columns populated; unused stay 0)
+# Inputs: args tuple of (B, K) or (1, K) float64; gy (B, K) for C=1 or (B, K, C).
+# Output: tuple of `used` float64 arrays, each shape (B, K).
 # -----------------------------------------------------------------------------
 
-def _vjp_0(p, gy):  # force_calculation_right
-    gp = np.zeros_like(p)
-    _, d_a, d_nl, d_nr = _cos_beta_and_derivs(p[..., 0], p[..., 1], p[..., 2])
-    g = np.real(gy[..., 0]) * _INV_CX
-    gp[..., 0] = g * d_a
-    gp[..., 1] = g * d_nl
-    gp[..., 2] = g * d_nr
-    return gp
+def _vjp_0(args, gy):  # force_calculation_right
+    alpha, n_l, n_r = args
+    _, d_a, d_nl, d_nr = _cos_beta_and_derivs(alpha, n_l, n_r)
+    g = np.real(gy) * _INV_CX
+    return (g * d_a, g * d_nl, g * d_nr)
 
 
-def _vjp_1(p, gy):  # laser
-    gp = np.zeros_like(p)
-    gy0 = gy[..., 0]
-    amp = np.sqrt(2.0 * p[..., 0] / EPSILON_0C)
-    e = np.exp(1j * (p[..., 1] * _DEG))
+def _vjp_1(args, gy):  # laser
+    power, phase = args
+    amp = np.sqrt(2.0 * power / EPSILON_0C)
+    e = np.exp(1j * (phase * _DEG))
     y = amp * e
     inv_amp = np.where(amp > 0.0, 1.0 / np.where(amp > 0.0, amp, 1.0), 0.0)
-    gp[..., 0] = np.real(gy0 * e) * (inv_amp / EPSILON_0C)
-    gp[..., 1] = np.real(gy0 * (1j * _DEG * y))
-    return gp
-
-
-def _vjp_2(p, gy):  # surface
-    gp = np.zeros_like(p)
-    loss, r_frac, tuning, freq, n_l, n_r, alpha = (
-        p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5], p[..., 6]
+    return (
+        np.real(gy * e) * (inv_amp / EPSILON_0C),
+        np.real(gy * (1j * _DEG * y)),
     )
+
+
+def _vjp_2(args, gy):  # surface
+    loss, r_frac, tuning, freq, n_l, n_r, alpha = args
     abs_r = (1.0 - loss) * r_frac
     abs_t = (1.0 - loss) * (1.0 - r_frac)
     f_fac = 1.0 + freq * _INV_F0
@@ -504,25 +520,24 @@ def _vjp_2(p, gy):  # surface
 
     sqrt_r = np.sqrt(abs_r)
     sqrt_t = np.sqrt(abs_t)
-    e_rl = np.exp(1j * (ps_l * cl))
-    e_t = np.exp(1j * (0.5 * np.pi + 0.5 * (ps_l * cl - ps_r * cr_t)))
+    ps_l_cl = ps_l * cl
+    e_rl = np.exp(1j * ps_l_cl)
+    e_t = np.exp(1j * (0.5 * np.pi + 0.5 * (ps_l_cl - ps_r * cr_t)))
     e_rr = np.exp(-1j * (ps_r * cr_r))
     r_l = -sqrt_r * e_rl
     t_val = -sqrt_t * e_t
     r_r = -sqrt_r * e_rr
 
-    g_rl, g_t, g_rr = gy[..., 0], gy[..., 1], gy[..., 2]
+    g_rl, g_t, g_rr = gy[:, :, 0], gy[:, :, 1], gy[:, :, 2]
 
-    # Derivatives wrt abs_r and abs_t
     inv_2sr = np.where(sqrt_r > 0.0, -0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), 0.0)
     inv_2st = np.where(sqrt_t > 0.0, -0.5 / np.where(sqrt_t > 0.0, sqrt_t, 1.0), 0.0)
     g_abs_r = np.real(g_rl * e_rl + g_rr * e_rr) * inv_2sr
     g_abs_t = np.real(g_t * e_t) * inv_2st
 
-    gp[..., 0] = -g_abs_r * r_frac - g_abs_t * (1.0 - r_frac)
-    gp[..., 1] = (g_abs_r - g_abs_t) * (1.0 - loss)
+    gp0 = -g_abs_r * r_frac - g_abs_t * (1.0 - r_frac)
+    gp1 = (g_abs_r - g_abs_t) * (1.0 - loss)
 
-    # Derivatives wrt phases: phi_rl = ps_l*cl, phi_t = pi/2 + 0.5*(ps_l*cl - ps_r*cr_t), phi_rr = -ps_r*cr_r
     g_phi_rl = np.real(g_rl * (1j * r_l))
     g_phi_t = np.real(g_t * (1j * t_val))
     g_phi_rr = np.real(g_rr * (1j * r_r))
@@ -538,40 +553,41 @@ def _vjp_2(p, gy):  # surface
     g_cr_r = g_psr_crr * ps_r
 
     g_t_scale = g_ps_l * n_l + g_ps_r * n_r
-    gp[..., 2] = g_t_scale * (2.0 * _DEG * f_fac)
-    gp[..., 3] = g_t_scale * (2.0 * t_rad * _INV_F0)
-    gp[..., 4] = g_ps_l * t_scale + g_cr_t * dcr_t_dnl + g_cr_r * dcr_r_dnl
-    gp[..., 5] = g_ps_r * t_scale + g_cr_t * dcr_t_dnr + g_cr_r * dcr_r_dnr
-    gp[..., 6] = g_cl * dcl_da + g_cr_t * dcr_t_da + g_cr_r * dcr_r_da
-    return gp
+    gp2 = g_t_scale * (2.0 * _DEG * f_fac)
+    gp3 = g_t_scale * (2.0 * t_rad * _INV_F0)
+    gp4 = g_ps_l * t_scale + g_cr_t * dcr_t_dnl + g_cr_r * dcr_r_dnl
+    gp5 = g_ps_r * t_scale + g_cr_t * dcr_t_dnr + g_cr_r * dcr_r_dnr
+    gp6 = g_cl * dcl_da + g_cr_t * dcr_t_da + g_cr_r * dcr_r_da
+    return (gp0, gp1, gp2, gp3, gp4, gp5, gp6)
 
 
-def _vjp_space_signed(p, gy, sign):
-    gp = np.zeros_like(p)
+def _vjp_space_signed(args, gy, sign):
+    p0, p1, p2 = args
     c = sign * _TWO_PI * _INV_C
-    theta = c * p[..., 0] * p[..., 1] * p[..., 2]
+    theta = c * p0 * p1 * p2
     y = -np.exp(1j * theta)
-    g_theta = np.real(gy[..., 0] * (1j * y)) * c
-    gp[..., 0] = g_theta * (p[..., 1] * p[..., 2])
-    gp[..., 1] = g_theta * (p[..., 0] * p[..., 2])
-    gp[..., 2] = g_theta * (p[..., 0] * p[..., 1])
-    return gp
+    g_theta = np.real(gy * (1j * y)) * c
+    return (
+        g_theta * (p1 * p2),
+        g_theta * (p0 * p2),
+        g_theta * (p0 * p1),
+    )
 
 
-def _vjp_3(p, gy):  # space
-    return _vjp_space_signed(p, gy, -1.0)
+def _vjp_3(args, gy):  # space
+    return _vjp_space_signed(args, gy, -1.0)
 
 
-def _vjp_9(p, gy):  # space_lower
-    return _vjp_space_signed(p, gy, 1.0)
+def _vjp_9(args, gy):  # space_lower
+    return _vjp_space_signed(args, gy, 1.0)
 
 
-def _vjp_space_mod_signed(p, gy, sign):
-    gp = np.zeros_like(p)
-    w_g = (sign * _TWO_PI) * p[..., 0]
+def _vjp_space_mod_signed(args, gy, sign):
+    p0, p1, p2 = args
+    w_g = (sign * _TWO_PI) * p0
     w_0 = _TWO_PI * F0
     half_inv_c = 0.5 * _INV_C
-    ln_factor = p[..., 1] * p[..., 2] * half_inv_c
+    ln_factor = p1 * p2 * half_inv_c
     arg = w_g * ln_factor
     sin_a = np.sin(arg)
     cos_a = np.cos(arg)
@@ -580,78 +596,68 @@ def _vjp_space_mod_signed(p, gy, sign):
     m_g = coef * sin_a
     e = np.exp(-1j * arg)
     y = 1j * m_g * e
-    gy0 = gy[..., 0]
 
-    g_mg = np.real(gy0 * (1j * e))
-    g_arg = np.real(gy0 * (-1j * y)) + g_mg * (coef * cos_a)
+    g_mg = np.real(gy * (1j * e))
+    g_arg = np.real(gy * (-1j * y)) + g_mg * (coef * cos_a)
     g_wg = g_mg * (-m_g * inv_wg) + g_arg * ln_factor
 
-    gp[..., 0] = g_wg * (sign * _TWO_PI)
-    gp[..., 1] = g_arg * (w_g * p[..., 2] * half_inv_c)
-    gp[..., 2] = g_arg * (w_g * p[..., 1] * half_inv_c)
-    return gp
-
-
-def _vjp_4(p, gy):  # space_modulation
-    return _vjp_space_mod_signed(p, gy, 1.0)
-
-
-def _vjp_16(p, gy):  # space_modulation_lower
-    return _vjp_space_mod_signed(p, gy, -1.0)
-
-
-def _vjp_5(p, gy):  # signal_function
-    gp = np.zeros_like(p)
-    e = np.exp(1j * (p[..., 1] * _DEG))
-    gy0 = gy[..., 0]
-    gp[..., 0] = np.real(gy0 * e)
-    gp[..., 1] = np.real(gy0 * (1j * _DEG * p[..., 0] * e))
-    return gp
-
-
-def _vjp_zero(p, gy):  # constants: dummy, vacuum_quantum_noise, laser_amplitude_modulation
-    return np.zeros_like(p)
-
-
-def _vjp_8(p, gy):  # loss_quantum_noise
-    gp = np.zeros_like(p)
-    gp[..., 0] = 0.5 * np.real(gy[..., 0])
-    return gp
-
-
-def _vjp_11(p, gy):  # laser_frequency_modulation
-    gp = np.zeros_like(p)
-    gp[..., 0] = np.real(gy[..., 0]) * (-EPSILON_0C * 0.5 / (p[..., 0] ** 2))
-    return gp
-
-
-def _vjp_18(p, gy):  # laser_frequency_modulation_lower
-    gp = np.zeros_like(p)
-    gp[..., 0] = np.real(gy[..., 0]) * (EPSILON_0C * 0.5 / (p[..., 0] ** 2))
-    return gp
-
-
-def _vjp_12(p, gy):  # susceptibility
-    gp = np.zeros_like(p)
-    w = _TWO_PI * p[..., 0]
-    y = 1.0 / (p[..., 1] * w * w)
-    g = np.real(gy[..., 0]) * y
-    gp[..., 0] = -2.0 * g / p[..., 0]
-    gp[..., 1] = -g / p[..., 1]
-    return gp
-
-
-def _vjp_13(p, gy):  # force_calculation_left
-    gp = np.zeros_like(p)
-    gp[..., 0] = np.real(gy[..., 0]) * (np.sin(p[..., 0] * _DEG) * _DEG * _INV_CX)
-    return gp
-
-
-def _vjp_14(p, gy):  # corrected_optomechanical_phase_left
-    gp = np.zeros_like(p)
-    freq, tuning, r_frac, loss, n_l, alpha = (
-        p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5]
+    return (
+        g_wg * (sign * _TWO_PI),
+        g_arg * (w_g * p2 * half_inv_c),
+        g_arg * (w_g * p1 * half_inv_c),
     )
+
+
+def _vjp_4(args, gy):  # space_modulation
+    return _vjp_space_mod_signed(args, gy, 1.0)
+
+
+def _vjp_16(args, gy):  # space_modulation_lower
+    return _vjp_space_mod_signed(args, gy, -1.0)
+
+
+def _vjp_5(args, gy):  # signal_function
+    p0, p1 = args
+    e = np.exp(1j * (p1 * _DEG))
+    return (
+        np.real(gy * e),
+        np.real(gy * (1j * _DEG * p0 * e)),
+    )
+
+
+def _vjp_zero(args, gy):  # constants: dummy, vacuum_quantum_noise, laser_amplitude_modulation
+    return ()
+
+
+def _vjp_8(args, gy):  # loss_quantum_noise
+    return (0.5 * np.real(gy),)
+
+
+def _vjp_11(args, gy):  # laser_frequency_modulation
+    (p0,) = args
+    return (np.real(gy) * (-EPSILON_0C * 0.5 / (p0 * p0)),)
+
+
+def _vjp_18(args, gy):  # laser_frequency_modulation_lower
+    (p0,) = args
+    return (np.real(gy) * (EPSILON_0C * 0.5 / (p0 * p0)),)
+
+
+def _vjp_12(args, gy):  # susceptibility
+    p0, p1 = args
+    w = _TWO_PI * p0
+    y = 1.0 / (p1 * w * w)
+    g = np.real(gy) * y
+    return (-2.0 * g / p0, -g / p1)
+
+
+def _vjp_13(args, gy):  # force_calculation_left
+    (p0,) = args
+    return (np.real(gy) * (np.sin(p0 * _DEG) * _DEG * _INV_CX),)
+
+
+def _vjp_14(args, gy):  # corrected_optomechanical_phase_left
+    freq, tuning, r_frac, loss, n_l, alpha = args
     abs_r = (1.0 - loss) * r_frac
     sqrt_r = np.sqrt(abs_r)
     a_rad = alpha * _DEG
@@ -662,27 +668,24 @@ def _vjp_14(p, gy):  # corrected_optomechanical_phase_left
     phase = t_rad * (freq * _INV_F0) + 2.0 * t_rad * n_l * f_fac * cl
     e = np.exp(1j * phase)
     y = (1j * _Z_SCALE) * cl * sqrt_r * e
-    gy0 = gy[..., 0]
 
-    g_cl = np.real(gy0 * ((1j * _Z_SCALE) * sqrt_r * e))
+    g_cl = np.real(gy * ((1j * _Z_SCALE) * sqrt_r * e))
     inv_2sr = np.where(sqrt_r > 0.0, 0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), 0.0)
-    g_abs_r = np.real(gy0 * ((1j * _Z_SCALE) * cl * inv_2sr * e))
-    g_phase = np.real(gy0 * (1j * y))
+    g_abs_r = np.real(gy * ((1j * _Z_SCALE) * cl * inv_2sr * e))
+    g_phase = np.real(gy * (1j * y))
 
-    gp[..., 0] = g_phase * (t_rad * _INV_F0 * (1.0 + 2.0 * n_l * cl))
-    gp[..., 1] = g_phase * (_DEG * (freq * _INV_F0 + 2.0 * n_l * f_fac * cl))
-    gp[..., 2] = g_abs_r * (1.0 - loss)
-    gp[..., 3] = -g_abs_r * r_frac
-    gp[..., 4] = g_phase * (2.0 * t_rad * f_fac * cl)
-    gp[..., 5] = (g_cl + g_phase * (2.0 * t_rad * n_l * f_fac)) * dcl_da
-    return gp
-
-
-def _vjp_15(p, gy):  # corrected_optomechanical_phase_right
-    gp = np.zeros_like(p)
-    freq, tuning, r_frac, loss, n_l, n_r, alpha = (
-        p[..., 0], p[..., 1], p[..., 2], p[..., 3], p[..., 4], p[..., 5], p[..., 6]
+    return (
+        g_phase * (t_rad * _INV_F0 * (1.0 + 2.0 * n_l * cl)),
+        g_phase * (_DEG * (freq * _INV_F0 + 2.0 * n_l * f_fac * cl)),
+        g_abs_r * (1.0 - loss),
+        -g_abs_r * r_frac,
+        g_phase * (2.0 * t_rad * f_fac * cl),
+        (g_cl + g_phase * (2.0 * t_rad * n_l * f_fac)) * dcl_da,
     )
+
+
+def _vjp_15(args, gy):  # corrected_optomechanical_phase_right
+    freq, tuning, r_frac, loss, n_l, n_r, alpha = args
     abs_r = (1.0 - loss) * r_frac
     sqrt_r = np.sqrt(abs_r)
     cr_om, dom_da, dom_dnl, dom_dnr = _cos_beta_and_derivs(alpha, n_l, n_r)
@@ -692,42 +695,42 @@ def _vjp_15(p, gy):  # corrected_optomechanical_phase_right
     phase = -t_rad * (freq * _INV_F0) - 2.0 * t_rad * n_r * f_fac * cr_rf
     e = np.exp(1j * phase)
     y = (-1j * _Z_SCALE) * cr_om * sqrt_r * e
-    gy0 = gy[..., 0]
 
-    g_cr_om = np.real(gy0 * ((-1j * _Z_SCALE) * sqrt_r * e))
+    g_cr_om = np.real(gy * ((-1j * _Z_SCALE) * sqrt_r * e))
     inv_2sr = np.where(sqrt_r > 0.0, 0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), 0.0)
-    g_abs_r = np.real(gy0 * ((-1j * _Z_SCALE) * cr_om * inv_2sr * e))
-    g_phase = np.real(gy0 * (1j * y))
+    g_abs_r = np.real(gy * ((-1j * _Z_SCALE) * cr_om * inv_2sr * e))
+    g_phase = np.real(gy * (1j * y))
     g_cr_rf = g_phase * (-2.0 * t_rad * n_r * f_fac)
 
-    gp[..., 0] = g_phase * (-t_rad * _INV_F0 * (1.0 + 2.0 * n_r * cr_rf))
-    gp[..., 1] = g_phase * (-_DEG * (freq * _INV_F0 + 2.0 * n_r * f_fac * cr_rf))
-    gp[..., 2] = g_abs_r * (1.0 - loss)
-    gp[..., 3] = -g_abs_r * r_frac
-    gp[..., 4] = g_cr_om * dom_dnl + g_cr_rf * drf_dnl
-    gp[..., 5] = g_cr_om * dom_dnr + g_cr_rf * drf_dnr + g_phase * (-2.0 * t_rad * f_fac * cr_rf)
-    gp[..., 6] = g_cr_om * dom_da + g_cr_rf * drf_da
-    return gp
+    return (
+        g_phase * (-t_rad * _INV_F0 * (1.0 + 2.0 * n_r * cr_rf)),
+        g_phase * (-_DEG * (freq * _INV_F0 + 2.0 * n_r * f_fac * cr_rf)),
+        g_abs_r * (1.0 - loss),
+        -g_abs_r * r_frac,
+        g_cr_om * dom_dnl + g_cr_rf * drf_dnl,
+        g_cr_om * dom_dnr + g_cr_rf * drf_dnr + g_phase * (-2.0 * t_rad * f_fac * cr_rf),
+        g_cr_om * dom_da + g_cr_rf * drf_da,
+    )
 
 
-def _vjp_17(p, gy):  # squeezer
-    gp = np.zeros_like(p)
+def _vjp_17(args, gy):  # squeezer
+    p0, p1 = args
     vu = UNIT_VACUUM * 0.5
     two_k = 2.0 * _SQ_K
-    two_s = two_k * p[..., 0]
+    two_s = two_k * p0
     sh = np.sinh(two_s)
     ch = np.cosh(two_s)
-    ph = np.exp(1j * (2.0 * _DEG) * p[..., 1])
+    ph = np.exp(1j * (2.0 * _DEG) * p1)
     u_o = (vu * sh) * ph
     l_o = np.conj(u_o)
 
-    g_ud, g_uo, g_ld, g_lo = gy[..., 0], gy[..., 1], gy[..., 2], gy[..., 3]
-    gp[..., 0] = (
+    g_ud, g_uo, g_ld, g_lo = gy[:, :, 0], gy[:, :, 1], gy[:, :, 2], gy[:, :, 3]
+    gp0 = (
         np.real(g_ud + g_ld) * (two_k * vu * sh)
         + np.real(g_uo * ph + g_lo * np.conj(ph)) * (two_k * vu * ch)
     )
-    gp[..., 1] = np.real(g_uo * (2j * _DEG * u_o) + g_lo * (-2j * _DEG * l_o))
-    return gp
+    gp1 = np.real(g_uo * (2j * _DEG * u_o) + g_lo * (-2j * _DEG * l_o))
+    return (gp0, gp1)
 
 
 NP_VJP_FUNCTIONS = (
@@ -735,6 +738,165 @@ NP_VJP_FUNCTIONS = (
     _vjp_9, _vjp_zero, _vjp_11, _vjp_12, _vjp_13, _vjp_14, _vjp_15, _vjp_16,
     _vjp_17, _vjp_18,
 )
+
+
+# -----------------------------------------------------------------------------
+# Precomputed grouped operation descriptor & parameter-gradient scatter plans
+# -----------------------------------------------------------------------------
+
+def _build_col_reduce_plan(targets: np.ndarray):
+    """Build an O(1)-dispatch accumulation plan for 1-D target indices (exact order).
+
+    Modes:
+      0: all entries map to a single target -> (0, int_target, None, None)
+      1: all entries map to distinct targets -> (1, targets_intp, None, None)
+      2: duplicate targets -> (2, uniq_targets, stable_order, reduceat_starts)
+    """
+    idx = np.asarray(targets, dtype=np.intp)
+    n = idx.size
+    if n == 0:
+        return None
+    if n == 1:
+        return (0, int(idx[0]), None, None)
+    if np.all(idx == idx[0]):
+        return (0, int(idx[0]), None, None)
+    order = np.argsort(idx, kind="stable")
+    ordered = idx[order]
+    first = np.empty(n, dtype=bool)
+    first[0] = True
+    first[1:] = ordered[1:] != ordered[:-1]
+    if first.all():
+        return (1, idx, None, None)
+    starts = np.flatnonzero(first)
+    uniq = ordered[starts]
+    return (2, uniq, order, starts)
+
+
+def build_op_group(
+    f_idx: int,
+    inp_sub: np.ndarray,
+    out_row: np.ndarray,
+    out_col: np.ndarray,
+    flat_pos: np.ndarray,
+    n_out_cols: int,
+    *,
+    bwd_flat_pos: np.ndarray | None = None,
+    sweep_rows: np.ndarray | None = None,
+    batch_sweep_set: set[int] | None = None,
+):
+    """Construct an `_OpGroup` with precomputed forward/backward gather & scatter plans."""
+    k = inp_sub.shape[0]
+    flat_pos_p = np.asarray(flat_pos, dtype=np.intp)
+    const_val = NP_CONST_VALUES.get(f_idx)
+    fwd_fn = NP_FWD_FUNCTIONS[f_idx]
+    vjp_fn = NP_VJP_FUNCTIONS[f_idx]
+
+    if const_val is not None:
+        return _OpGroup(
+            f_idx=f_idx,
+            fwd_fn=None,
+            vjp_fn=_vjp_zero,
+            const_val=const_val,
+            k=k,
+            n_out_cols=n_out_cols,
+            inp_cols=(),
+            col_swept=(),
+            flat_pos=flat_pos_p,
+            fwd_out_idx=None,
+            gy_plan=(),
+            gy_full_first=False,
+            col_scatter=(),
+        )
+
+    inp_cols = tuple(np.ascontiguousarray(inp_sub[:, j], dtype=np.intp) for j in range(inp_sub.shape[1]))
+    if batch_sweep_set:
+        if len(batch_sweep_set) == 1:
+            sw0 = next(iter(batch_sweep_set))
+            col_swept = tuple(bool((col == sw0).any()) for col in inp_cols)
+        else:
+            sw_arr = np.fromiter(batch_sweep_set, dtype=np.intp, count=len(batch_sweep_set))
+            col_swept = tuple(bool(np.isin(col, sw_arr).any()) for col in inp_cols)
+    else:
+        col_swept = (False,) * len(inp_cols)
+
+    flat_out = out_row.astype(np.intp) * n_out_cols + out_col.astype(np.intp)
+    m_total = k * n_out_cols
+    is_identity_out = (flat_out.size == m_total) and np.array_equal(flat_out, np.arange(m_total, dtype=np.intp))
+    fwd_out_idx = None if is_identity_out else flat_out
+
+    bwd_fp = flat_pos_p if bwd_flat_pos is None else np.asarray(bwd_flat_pos, dtype=np.intp)
+    raw_gy = build_scatter_plan(flat_out)
+    gy_batches = []
+    arange_m = np.arange(m_total, dtype=np.intp)
+    for pos, dst in raw_gy:
+        fp_r = bwd_fp if pos is None else bwd_fp[pos]
+        dst_r = None if (dst.size == m_total and np.array_equal(dst, arange_m)) else dst
+        gy_batches.append((fp_r, dst_r))
+    gy_plan = tuple(gy_batches)
+    gy_full_first = bool(gy_plan) and (gy_plan[0][1] is None)
+
+    col_scatter = []
+    if sweep_rows is None:
+        for col in inp_cols:
+            col_scatter.append((0, _build_col_reduce_plan(col)))
+    else:
+        for col in inp_cols:
+            slots = sweep_rows[col]
+            is_sw = slots >= 0
+            if not is_sw.any():
+                col_scatter.append((1, _build_col_reduce_plan(col)))
+            elif is_sw.all():
+                col_scatter.append((2, _build_col_reduce_plan(slots)))
+            else:
+                sw_pos = np.flatnonzero(is_sw)
+                ns_pos = np.flatnonzero(~is_sw)
+                col_scatter.append((
+                    3,
+                    (sw_pos, _build_col_reduce_plan(slots[sw_pos])),
+                    (ns_pos, _build_col_reduce_plan(col[ns_pos])),
+                ))
+
+    return _OpGroup(
+        f_idx=f_idx,
+        fwd_fn=fwd_fn,
+        vjp_fn=vjp_fn,
+        const_val=None,
+        k=k,
+        n_out_cols=n_out_cols,
+        inp_cols=inp_cols,
+        col_swept=col_swept,
+        flat_pos=flat_pos_p,
+        fwd_out_idx=fwd_out_idx,
+        gy_plan=gy_plan,
+        gy_full_first=gy_full_first,
+        col_scatter=tuple(col_scatter),
+    )
+
+
+class _OpGroup:
+    __slots__ = (
+        "f_idx", "fwd_fn", "vjp_fn", "const_val", "k", "n_out_cols",
+        "inp_cols", "col_swept", "flat_pos", "fwd_out_idx",
+        "gy_plan", "gy_full_first", "col_scatter",
+    )
+
+    def __init__(
+        self, *, f_idx, fwd_fn, vjp_fn, const_val, k, n_out_cols,
+        inp_cols, col_swept, flat_pos, fwd_out_idx, gy_plan, gy_full_first, col_scatter,
+    ):
+        self.f_idx = f_idx
+        self.fwd_fn = fwd_fn
+        self.vjp_fn = vjp_fn
+        self.const_val = const_val
+        self.k = k
+        self.n_out_cols = n_out_cols
+        self.inp_cols = inp_cols
+        self.col_swept = col_swept
+        self.flat_pos = flat_pos
+        self.fwd_out_idx = fwd_out_idx
+        self.gy_plan = gy_plan
+        self.gy_full_first = gy_full_first
+        self.col_scatter = col_scatter
 
 
 # -----------------------------------------------------------------------------
@@ -748,14 +910,18 @@ class SparseTopology:
         "cn", "sn", "nnz_c", "nnz_s", "nnz_n", "num_detectors",
         "opt_param_idx", "opt_val_idx",
         "car_ch_idx", "sig_ch_idx",
-        "qhd_param_idx", "qhd_placing_idx",
+        "qhd_param_idx", "qhd_placing_idx", "qhd_scatter_plan",
         "carrier_base_aug", "carrier_csc_rows", "carrier_csc_cols",
         "carrier_csc_indices", "carrier_csc_indptr", "carrier_groups",
         "signal_base_aug", "signal_csc_rows", "signal_csc_cols",
         "signal_csc_indices", "signal_csc_indptr",
         "signal_block_plan",
         "signal_groups_static", "signal_groups_sweep",
-        "signal_carrier_indices", "signal_carrier_flat_pos", "signal_conj_mask",
+        "signal_carrier_indices", "signal_carrier_flat_pos", "signal_carrier_scatter_plan",
+        "signal_static_conj_idx", "signal_sweep_conj_idx",
+        "bwd_sig_n_act", "bwd_sig_n_act_a",
+        "bwd_sig_a_rows", "bwd_sig_a_cols", "bwd_sig_rhs_rows",
+        "bwd_sig_conj_idx", "bwd_sig_car_pos", "bwd_sig_static_pos",
         "noise_base_vals", "noise_rows", "noise_cols",
         "noise_groups_static", "noise_groups_sweep",
         "noise_grad_order", "noise_grad_starts", "noise_grad_indices",
@@ -783,37 +949,113 @@ jax.tree_util.register_pytree_node(
 
 def _apply_np_groups(buf: np.ndarray, params: np.ndarray, groups: tuple) -> None:
     """In-place vectorized evaluation of grouped NumPy component functions."""
-    for f_idx, inp_idx, out_row, out_col, flat_pos, _ in groups:
-        out = NP_FWD_FUNCTIONS[f_idx](params[:, inp_idx])  # (B, K, C)
-        buf[:, flat_pos] = out[:, out_row, out_col]
+    b = params.shape[0]
+    for g in groups:
+        if g.const_val is not None:
+            buf[:, g.flat_pos] = g.const_val
+            continue
+        if b > 1:
+            args = tuple(
+                params[:, col] if swept else params[:1, col]
+                for col, swept in zip(g.inp_cols, g.col_swept)
+            )
+        else:
+            args = tuple(params[:, col] for col in g.inp_cols)
+        out = g.fwd_fn(args)
+        if g.fwd_out_idx is None:
+            buf[:, g.flat_pos] = out
+        else:
+            buf[:, g.flat_pos] = out[:, g.fwd_out_idx]
+
+
+def _scatter_col_1d(dst_1d: np.ndarray, plan, vals_1d: np.ndarray) -> None:
+    mode, target, order, starts = plan
+    if mode == 0:
+        dst_1d[target] += vals_1d.sum()
+    elif mode == 1:
+        dst_1d[target] += vals_1d
+    else:
+        dst_1d[target] += np.add.reduceat(vals_1d[order], starts)
+
+
+def _scatter_col_2d(dst_2d: np.ndarray, plan, vals_2d: np.ndarray) -> None:
+    mode, target, order, starts = plan
+    if mode == 0:
+        dst_2d[:, target] += vals_2d.sum(axis=1)
+    elif mode == 1:
+        dst_2d[:, target] += vals_2d
+    else:
+        dst_2d[:, target] += np.add.reduceat(vals_2d[:, order], starts, axis=1)
+
+
+def _scatter_col_sweep(g_sweep: np.ndarray, plan, vals_2d: np.ndarray) -> None:
+    mode, target, order, starts = plan
+    if mode == 0:
+        g_sweep[target] += vals_2d.sum(axis=1)
+    elif mode == 1:
+        g_sweep[target] += vals_2d.T
+    else:
+        g_sweep[target] += np.add.reduceat(vals_2d[:, order], starts, axis=1).T
 
 
 def _vjp_np_groups(
-    g_buf: np.ndarray, params: np.ndarray, groups: tuple, g_params: np.ndarray, sweep=None,
+    g_buf: np.ndarray, params: np.ndarray, groups: tuple, g_params: np.ndarray, g_sweep=None,
 ) -> None:
-    """Accumulate parameter gradients from sparse buffer cotangents into g_params."""
-    B = params.shape[0]
-    for f_idx, inp_idx, out_row, out_col, flat_pos, n_out_cols in groups:
-        vjp = NP_VJP_FUNCTIONS[f_idx]
+    """Accumulate parameter gradients from sparse buffer cotangents into g_params/g_sweep."""
+    b = params.shape[0]
+    for g in groups:
+        vjp = g.vjp_fn
         if vjp is _vjp_zero:
             continue
-        K = inp_idx.shape[0]
-        # Gather upstream cotangent for each (b, k, c)
-        gy = np.zeros((B, K, n_out_cols), dtype=np.complex128)
-        np.add.at(gy, (slice(None), out_row, out_col), g_buf[:, flat_pos])
-        gp_local = vjp(params[:, inp_idx], gy)
-        if sweep is not None:
-            sweep_rows, g_sweep = sweep
-            flat_indices = inp_idx.ravel()
-            flat_grad = gp_local.reshape(B, -1)
-            slots = sweep_rows[flat_indices]
-            is_swept = slots >= 0
-            np.add.at(g_sweep, (slots[is_swept], slice(None)), flat_grad[:, is_swept].T)
-            np.add.at(g_params[0], flat_indices[~is_swept], flat_grad[:, ~is_swept].sum(axis=0))
-        elif B == 1:
-            np.add.at(g_params[0], inp_idx.ravel(), gp_local[0].ravel())
+
+        gy_plan = g.gy_plan
+        if g.gy_full_first:
+            fp0 = gy_plan[0][0]
+            gy = g_buf[:, fp0]
+            for fp_r, dst_r in gy_plan[1:]:
+                if dst_r is None:
+                    gy += g_buf[:, fp_r]
+                else:
+                    gy[:, dst_r] += g_buf[:, fp_r]
         else:
-            np.add.at(g_params, (slice(None), inp_idx.ravel()), gp_local.reshape(B, -1))
+            gy = np.zeros((b, g.k * g.n_out_cols), dtype=np.complex128)
+            for idx_r, (fp_r, dst_r) in enumerate(gy_plan):
+                if idx_r == 0:
+                    gy[:, dst_r] = g_buf[:, fp_r]
+                elif dst_r is None:
+                    gy += g_buf[:, fp_r]
+                else:
+                    gy[:, dst_r] += g_buf[:, fp_r]
+
+        if g.n_out_cols > 1:
+            gy = gy.reshape(b, g.k, g.n_out_cols)
+
+        if b > 1:
+            args = tuple(
+                params[:, col] if swept else params[:1, col]
+                for col, swept in zip(g.inp_cols, g.col_swept)
+            )
+        else:
+            args = tuple(params[:, col] for col in g.inp_cols)
+
+        gp_cols = vjp(args, gy)
+
+        for gp_j, spec in zip(gp_cols, g.col_scatter):
+            kind = spec[0]
+            if kind == 0:
+                if b == 1:
+                    _scatter_col_1d(g_params[0], spec[1], gp_j[0])
+                else:
+                    _scatter_col_2d(g_params, spec[1], gp_j)
+            elif kind == 1:
+                _scatter_col_1d(g_params[0], spec[1], gp_j.sum(axis=0))
+            elif kind == 2:
+                _scatter_col_sweep(g_sweep, spec[1], gp_j)
+            else:
+                sw_pos, sw_plan = spec[1]
+                ns_pos, ns_plan = spec[2]
+                _scatter_col_sweep(g_sweep, sw_plan, gp_j[:, sw_pos])
+                _scatter_col_1d(g_params[0], ns_plan, gp_j[:, ns_pos].sum(axis=0))
 
 
 def _expand_np(p_row: np.ndarray, indices: np.ndarray, values: np.ndarray) -> np.ndarray:
@@ -895,6 +1137,9 @@ def sparse_simulate_fwd_host(
 
     sig_aug_static = np.broadcast_to(topo.signal_base_aug[None, :], (b_car, nnz_s + sn)).copy()
     _apply_np_groups(sig_aug_static, p_car, topo.signal_groups_static)
+    if topo.signal_static_conj_idx.size > 0:
+        sc_idx = topo.signal_static_conj_idx
+        sig_aug_static[:, sc_idx] = np.conj(sig_aug_static[:, sc_idx])
     if b_sig != b_car:
         sig_aug = np.broadcast_to(sig_aug_static, (b_sig, nnz_s + sn)).copy()
     else:
@@ -903,10 +1148,13 @@ def sparse_simulate_fwd_host(
 
     carrier_couplings = sig_aug[:, topo.signal_carrier_flat_pos]
     if topo.signal_carrier_flat_pos.size > 0:
-        sig_aug[:, topo.signal_carrier_flat_pos] = -carrier_couplings * carrier[:, topo.signal_carrier_indices]
+        coupled = np.negative(carrier_couplings)
+        coupled *= carrier[:, topo.signal_carrier_indices]
+        sig_aug[:, topo.signal_carrier_flat_pos] = coupled
 
-    if topo.signal_conj_mask.any():
-        sig_aug[:, topo.signal_conj_mask] = np.conj(sig_aug[:, topo.signal_conj_mask])
+    if topo.signal_sweep_conj_idx.size > 0:
+        c_idx = topo.signal_sweep_conj_idx
+        sig_aug[:, c_idx] = np.conj(sig_aug[:, c_idx])
 
     sig_A = sig_aug[:, :nnz_s]
     if topo.signal_block_plan is not None:
@@ -943,10 +1191,10 @@ def sparse_simulate_fwd_host(
         _apply_np_groups(n_vals, p_sig, topo.noise_groups_sweep)
 
     if D > 0 and topo.nnz_n > 0:
-        temp_sum = np.sum(
-            np.real(np.conj(w[:, :, topo.noise_rows]) * n_vals[None, :, :] * w[:, :, topo.noise_cols]),
-            axis=2,
-        )
+        w_term = np.conj(w[:, :, topo.noise_rows])
+        w_term *= n_vals[None, :, :]
+        w_term *= w[:, :, topo.noise_cols]
+        temp_sum = np.sum(w_term.real, axis=2)
         noise = np.sqrt(_NOISE_SCALE * temp_sum)
     else:
         noise = np.zeros((D, b_sig), dtype=np.float64)
@@ -990,7 +1238,7 @@ def sparse_simulate_bwd_host(
     g_noise = np.asarray(g_noise_in, dtype=np.float64)
 
     cn, sn = topo.cn, topo.sn
-    nnz_c, nnz_s = topo.nnz_c, topo.nnz_s
+    nnz_c = topo.nnz_c
     D = topo.num_detectors
 
     if topo.car_ch_idx.size > 0:
@@ -1009,11 +1257,6 @@ def sparse_simulate_bwd_host(
     g_p_car = np.zeros_like(p_car)
     g_p_sig = np.zeros_like(p_car)
     g_sig_ch = np.zeros_like(sig_ch_vals)
-    signal_sweep = None
-    if topo.sig_ch_idx.size:
-        sweep_rows = np.full(p_car.shape[1], -1, dtype=np.int32)
-        sweep_rows[topo.sig_ch_idx] = np.arange(topo.sig_ch_idx.size)
-        signal_sweep = (sweep_rows, g_sig_ch)
     g_nsv = np.zeros_like(nsv_base)
 
     # 1. Backprop through noise = sqrt(_NOISE_SCALE * Re(w^H N w))
@@ -1021,56 +1264,69 @@ def sparse_simulate_bwd_host(
     g_n_vals = np.zeros((n_vals.shape[0], topo.nnz_n), dtype=np.complex128)
 
     if D > 0 and topo.nnz_n > 0:
-        # g_temp_sum = g_noise * (_NOISE_SCALE / (2 * noise))
         with np.errstate(divide="ignore", invalid="ignore"):
             g_ts = g_noise * (0.5 * _NOISE_SCALE / noise)
-        w_r = w[:, :, topo.noise_rows]  # (D, b_sig, nnz_n)
-        w_c = w[:, :, topo.noise_cols]  # (D, b_sig, nnz_n)
-        # Re(conj(w_r) * n_k * w_c):
-        # wrt n_k: delta Re(conj(w_r)*w_c * dn_k) -> g_n_k = g_ts * conj(w_r) * w_c
-        g_n_term = g_ts[:, :, None] * np.conj(w_r) * w_c  # (D, b_sig, nnz_n)
+        w_r_conj = np.conj(w[:, :, topo.noise_rows])
+        w_c = w[:, :, topo.noise_cols]
+        g_ts3 = g_ts[:, :, None]
+        g_n_term = g_ts3 * w_r_conj
+        g_n_term *= w_c
         if n_vals.shape[0] == 1:
             g_n_vals[0] = g_n_term.sum(axis=(0, 1))
         else:
             g_n_vals = g_n_term.sum(axis=0)
 
-        # wrt w_r: Re(conj(dw_r) * (n_k * w_c)) = Re(dw_r * conj(n_k * w_c)) -> g_wr = g_ts * conj(n_k * w_c)
-        # wrt w_c: Re(dw_c * (conj(w_r) * n_k)) -> g_wc = g_ts * conj(w_r) * n_k
-        g_wr = g_ts[:, :, None] * np.conj(n_vals[None, :, :] * w_c)
-        g_wc = g_ts[:, :, None] * (np.conj(w_r) * n_vals[None, :, :])
+        g_wr = n_vals[None, :, :] * w_c
+        np.conj(g_wr, out=g_wr)
+        g_wr *= g_ts3
+        g_wc = w_r_conj * n_vals[None, :, :]
+        g_wc *= g_ts3
         terms = np.concatenate((g_wr, g_wc), axis=2)
         g_w[:, :, topo.noise_grad_indices] = np.add.reduceat(
             terms[:, :, topo.noise_grad_order], topo.noise_grad_starts, axis=2,
         )
 
         if topo.noise_groups_sweep:
-            _vjp_np_groups(g_n_vals, p_sig, topo.noise_groups_sweep, g_p_sig, signal_sweep)
+            _vjp_np_groups(g_n_vals, p_sig, topo.noise_groups_sweep, g_p_sig, g_sig_ch)
             g_n_static = g_n_vals.sum(axis=0, keepdims=True) if b_car == 1 else g_n_vals
         else:
             g_n_static = g_n_vals
         _vjp_np_groups(g_n_static, p_car, topo.noise_groups_static, g_p_car)
 
     # 2. Backprop through SuperLU signal + adjoint noise solve
-    g_sig_aug = np.empty((b_sig, nnz_s + sn), dtype=np.complex128)
-    s_rows = topo.signal_csc_rows
-    s_cols = topo.signal_csc_cols
-
     lam_x_all, adjoint = _solve_signal_systems(
         topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N", cache="reuse"
     )
     g_c_sel_full = np.moveaxis(np.conj(adjoint), -1, 0)
 
-    g_sig_aug[:, nnz_s:] = lam_x_all
-    gA_all = -lam_x_all[:, s_rows] * signal[:, s_cols]
-    if D == 1:
-        gA_all -= np.conj(w[0][:, s_rows] * g_c_sel_full[0][:, s_cols])
-    elif D > 1:
-        gA_all -= np.sum(np.conj(w[:, :, s_rows] * g_c_sel_full[:, :, s_cols]), axis=0)
-    g_sig_aug[:, :nnz_s] = gA_all
+    # Compute gA and RHS cotangents ONLY for active signal slots in a compact buffer.
+    n_act = topo.bwd_sig_n_act
+    n_act_a = topo.bwd_sig_n_act_a
+    g_sig_aug = np.empty((b_sig, n_act), dtype=np.complex128)
+    if n_act_a > 0:
+        a_rows = topo.bwd_sig_a_rows
+        a_cols = topo.bwd_sig_a_cols
+        gA = g_sig_aug[:, :n_act_a]
+        np.take(lam_x_all, a_rows, axis=1, out=gA)
+        np.negative(gA, out=gA)
+        gA *= signal[:, a_cols]
+        if D == 1:
+            t2 = w[0][:, a_rows]
+            t2 *= g_c_sel_full[0][:, a_cols]
+            np.conj(t2, out=t2)
+            gA -= t2
+        elif D > 1:
+            for d in range(D):
+                t2 = w[d][:, a_rows]
+                t2 *= g_c_sel_full[d][:, a_cols]
+                np.conj(t2, out=t2)
+                gA -= t2
+    if topo.bwd_sig_rhs_rows.size > 0:
+        g_sig_aug[:, n_act_a:] = lam_x_all[:, topo.bwd_sig_rhs_rows]
 
     # 3. Backprop through carrier_selections (and optional QHD phases) -> g_carrier & g_p_base
     if D > 0:
-        g_c_sel = g_c_sel_full.sum(axis=1, keepdims=True) if b_car == 1 else g_c_sel_full  # (D, b_car, sn)
+        g_c_sel = g_c_sel_full.sum(axis=1, keepdims=True) if b_car == 1 else g_c_sel_full
         nsv = nsv_base.copy()
         if topo.qhd_param_idx.size > 0:
             qhd_phases = np.exp(1j * (p_base[0, topo.qhd_param_idx] * _DEG))
@@ -1078,10 +1334,7 @@ def sparse_simulate_bwd_host(
             nsv[idx3[:, 0], idx3[:, 1], idx3[:, 2]] *= qhd_phases
         nsv_b = np.broadcast_to(nsv, (D, b_car, sn))
 
-        # upper: c_sel[:cn] = nsv[:cn] * carrier -> g_carrier += sum_d(g_c_sel[:cn] * nsv[:cn])
         g_carrier += np.sum(g_c_sel[:, :, :cn] * nsv_b[:, :, :cn], axis=0)
-        # lower: c_sel[cn:2cn] = conj(nsv[cn:2cn] * carrier)
-        # Re(g * conj(nsv * dcar)) = Re(conj(g) * nsv * dcar) -> g_carrier += sum_d(conj(g) * nsv)
         g_carrier += np.sum(np.conj(g_c_sel[:, :, cn : 2 * cn]) * nsv_b[:, :, cn : 2 * cn], axis=0)
 
         g_nsv[:, :, :cn] = np.sum(g_c_sel[:, :, :cn] * carrier[None, :, :], axis=1, keepdims=True)
@@ -1092,31 +1345,36 @@ def sparse_simulate_bwd_host(
         if topo.qhd_param_idx.size > 0:
             phase_positions = tuple(idx3.T)
             g_qhd = np.real(g_nsv[phase_positions] * (1j * _DEG * nsv[phase_positions]))
-            np.add.at(g_p_base[0], topo.qhd_param_idx, g_qhd)
+            scatter_add_1d(g_p_base[0], topo.qhd_scatter_plan, g_qhd)
             g_nsv[phase_positions] *= qhd_phases
 
-    # 4. Backprop through signal conjugation mask
-    if topo.signal_conj_mask.any():
-        g_sig_aug[:, topo.signal_conj_mask] = np.conj(g_sig_aug[:, topo.signal_conj_mask])
+    # 4. Backprop through signal conjugation mask (active slots only)
+    if topo.bwd_sig_conj_idx.size > 0:
+        c_idx = topo.bwd_sig_conj_idx
+        g_sig_aug[:, c_idx] = np.conj(g_sig_aug[:, c_idx])
 
-    # 5. Backprop through carrier-signal coupling:
-    #    sig_after[pos] = -sig_before[pos] * carrier[c_idx]
-    if topo.signal_carrier_flat_pos.size > 0:
-        pos = topo.signal_carrier_flat_pos
-        c_idx = topo.signal_carrier_indices
-        g_pos = g_sig_aug[:, pos]  # (b_sig, C_len)
+    # 5. Backprop through carrier-signal coupling
+    if topo.bwd_sig_car_pos.size > 0:
+        pos = topo.bwd_sig_car_pos
+        g_pos = g_sig_aug[:, pos]
         g_car_contrib = -g_pos * carrier_couplings
         if b_car == 1:
-            np.add.at(g_carrier[0], c_idx, g_car_contrib.sum(axis=0))
+            scatter_add_1d(g_carrier[0], topo.signal_carrier_scatter_plan, g_car_contrib.sum(axis=0))
         else:
-            for bi in range(b_car):
-                np.add.at(g_carrier[bi], c_idx, g_car_contrib[bi])
-        g_sig_aug[:, pos] = -g_pos * carrier[:, c_idx]
+            scatter_add_axis1(g_carrier, topo.signal_carrier_scatter_plan, g_car_contrib)
+        np.negative(g_pos, out=g_pos)
+        g_pos *= carrier[:, topo.signal_carrier_indices]
+        g_sig_aug[:, pos] = g_pos
 
     # 6. Backprop through signal component functions (sweep & static)
-    _vjp_np_groups(g_sig_aug, p_sig, topo.signal_groups_sweep, g_p_sig, signal_sweep)
+    _vjp_np_groups(g_sig_aug, p_sig, topo.signal_groups_sweep, g_p_sig, g_sig_ch)
     if topo.signal_groups_static:
-        g_sig_static = g_sig_aug.sum(axis=0, keepdims=True) if b_car == 1 else g_sig_aug
+        if b_car == 1:
+            g_sig_static = np.empty((1, n_act), dtype=np.complex128)
+            sp = topo.bwd_sig_static_pos
+            g_sig_static[0, sp] = g_sig_aug[:, sp].sum(axis=0)
+        else:
+            g_sig_static = g_sig_aug
         _vjp_np_groups(g_sig_static, p_car, topo.signal_groups_static, g_p_car)
 
     # 7. Backprop through carrier SuperLU solve -> carrier component functions -> g_p_base
