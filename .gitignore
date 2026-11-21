@@ -14,3 +14,4 @@ examples/results/
 # team tooling
 .bench/
 uv.lock
+MEMORY.local.md
