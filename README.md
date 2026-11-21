@@ -1,8 +1,10 @@
 # Faster Physics — START Hack Munich 2026
 
-Make **Differometor** faster while preserving its physical predictions and gradients.
+Make **Differometor** faster for general optical setups while preserving its physical predictions and gradients.
 
 This repository includes the public simulator source, example data, [challenge PDF](challenge.pdf), [judging criteria PDF](judging-criteria.pdf), [editable brief](challenge.docx), a short [start-here example](start_here.py), and a [full benchmark](benchmark.py). No separate simulator checkout or GPU is required.
+
+**Final evaluation uses a different optical setup**, a slight variation of the supplied example. Use this example to develop and benchmark improvements that carry over to other optical setups.
 
 ## Start here
 
@@ -41,9 +43,9 @@ python benchmark.py --cpus 1 --output benchmark-baseline.json
 - **Process killed / out of memory:** close other memory-heavy applications or use a machine with more available RAM. Reducing `--repeats` shortens the run but does not reduce peak memory.
 - **Numerical check fails:** restore the unchanged public fixtures and run the unmodified baseline with the pinned dependencies before investigating your changes.
 
-## The workload
+## Development benchmark
 
-One complete saved 3×3 optical setup, all **101 frequencies from 800–3000 Hz**, and gradients for **193 physical design variables**. Every evaluation computes carrier fields, signal, quantum noise, detector sensitivity, powers and the gradient of mean log sensitivity relative to the public reference.
+The supplied example uses one complete saved 3×3 optical setup, all **101 frequencies from 800–3000 Hz**, and gradients for **193 physical design variables**. Every evaluation computes carrier fields, signal, quantum noise, detector sensitivity, powers and the gradient of mean log sensitivity relative to the public reference.
 
 In `benchmark.py`, the complete first-run total includes input preparation, all compilation, the forward simulation, sensitivity and gradients. Imports, CPU initialization and result transfer are included. Validation and benchmark logging/report/plot generation are excluded. There is no optimization loop.
 
@@ -56,7 +58,7 @@ The benchmark’s five bars group the detailed measurements without dropping wor
 3. Run `python benchmark.py --cpus 1 --output benchmark-candidate.json`.
 4. Compare complete time, including compilation, on matching hardware, CPU affinity and software. Report median warm runtime separately and repeat measurements to assess variability.
 
-Keep the setup, every frequency, double precision, physical outputs and gradients. The full benchmark runs the quick correctness checks described below. Precomputed answers and omitted calculations do not count.
+For local comparisons, keep the supplied setup, every frequency, double precision, physical outputs and gradients. Optimize the simulator so the speedup carries over to other optical setups. The full benchmark runs the quick correctness checks described below. Precomputed answers and omitted calculations do not count.
 
 Submit your code, before/after JSON reports and plots, and reproduction commands. A short note on your approach and correctness checks is welcome.
 
@@ -68,15 +70,15 @@ Download the standalone [Judging Criteria PDF](judging-criteria.pdf), including 
 - **Second prize:** Second-lowest complete evaluation time among correct submissions.
 - **Special prize:** The most surprising solution, chosen by the Feyer team.
 
-The speed prizes use the **complete first-run benchmark total** on matching hardware and CPU limits. Include imports, initialization, input preparation, all compilation, forward simulation, sensitivity, gradients and result transfer. Validation and benchmark reporting remain outside the timer; warm runtime is reported separately.
+The speed prizes use the **complete first-run total on the final optical setup**, with matching hardware and CPU limits. Include imports, initialization, input preparation, all compilation, forward simulation, sensitivity, gradients and result transfer. Validation and benchmark reporting remain outside the timer; warm runtime is reported separately.
 
 AI coding tools are welcome. A high-level explanation of your approach, why it helps and what you learned is encouraged and helps the Feyer team understand your work.
 
 ## Correctness: quick checks
 
-A correct submission evaluates the complete setup with all **101 frequencies**, all **193 design variables** and double precision. It preserves the physical results and gradients.
+A correct submission evaluates the complete input setup, all requested frequencies and design variables, in double precision. It preserves physical results and gradients on both the development example and the final setup.
 
-The supplied checks require:
+For the supplied development benchmark (**101 frequencies**, **193 design variables**), the checks require:
 
 - **Correct sensitivities:** positive sensitivity at every frequency, matching the public reference with `abs(log(sensitivity) - log(reference)) <= 1e-5` (natural logarithm; about 0.001% relative difference).
 - **Finite results:** carrier, signal, noise, sensitivity, powers, loss and all 193 gradient values contain no NaN or infinity; the gradient is not identically zero.
