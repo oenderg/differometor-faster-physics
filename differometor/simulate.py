@@ -125,7 +125,9 @@ def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind
 
     def _call(opt, base, car_sweep, sig_sweep, vectors):
         bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
-        carrier, signal, noise, *residuals = sparse_simulate_fwd_host(topo, bound, car_sweep, sig_sweep, vectors)
+        carrier, signal, noise, *residuals = sparse_simulate_fwd_host(
+            topo, bound, car_sweep, sig_sweep, vectors, save_factors=save_residuals
+        )
         outputs = (carrier.T, signal.T, noise)
         return (*outputs, *residuals) if save_residuals else outputs
 

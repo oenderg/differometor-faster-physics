@@ -16,6 +16,7 @@ from importlib.machinery import EXTENSION_SUFFIXES
 from importlib.metadata import version
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 import jax
@@ -160,15 +161,10 @@ class _SweepFactorization:
                 self.reordered = _CSCWorkspace(self.matrix.shape[0], rows, pointers)
             return factors
 
-        self.factors = _factorize(self.reordered, values[self.positions], ordering="NATURAL")
-        if self.factors is None:
+        factors = _factorize(self.reordered, values[self.positions], ordering="NATURAL")
+        if factors is None:
             return _factorize(self.matrix, values)
-        return self
-
-    def solve(self, rhs, trans="N"):
-        if trans == "N":
-            return self.factors.solve(rhs)[self.inverse_order]
-        return self.factors.solve(rhs[self.order], trans=trans)
+        return _FrequencySolver(factors, self.order, self.inverse_order)
 
 
 def _solve_refined(matrix, factors, rhs, trans="N"):
@@ -178,7 +174,52 @@ def _solve_refined(matrix, factors, rhs, trans="N"):
     return solution + factors.solve(residual, trans=trans)
 
 
-def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, second_trans):
+class _FrequencySolver:
+    """One frequency's LU factors, kept in the ordering used to compute them."""
+
+    __slots__ = ("lu", "order", "inverse_order")
+
+    def __init__(self, lu, order, inverse_order):
+        self.lu, self.order, self.inverse_order = lu, order, inverse_order
+
+    def solve(self, rhs, trans="N"):
+        if trans == "N":
+            return self.lu.solve(rhs)[self.inverse_order]
+        return self.lu.solve(rhs[self.order], trans=trans)
+
+
+class _ForwardFactors:
+    """Transfer one sweep's numerical factors from the forward callback to a pullback."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._entry = None
+
+    def save(self, topology, values, factors):
+        entry = (topology, values.copy(), factors)
+        with self._lock:
+            self._entry = entry
+
+    def take(self, topology, values):
+        # Claim ownership before using SuperLU; simultaneous pullbacks can always refactor.
+        with self._lock:
+            entry = self._entry
+            self._entry = None
+        if entry is None or entry[0] is not topology:
+            return None
+        _, saved, factors = entry
+        if saved.dtype != values.dtype or saved.shape != values.shape:
+            return None
+        if not np.array_equal(saved.view(np.void), values.view(np.void)):
+            return None
+        return factors
+
+
+_signal_factors = _ForwardFactors()
+_carrier_factors = _ForwardFactors()
+
+
+def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, second_trans, *, cache="none"):
     """Factor the coupled block once per frequency for both right-hand sides."""
     plan = topo.signal_block_plan
     finite = np.isfinite(values).all(axis=1)
@@ -210,9 +251,19 @@ def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, seco
         # The condensed right-hand sides are private buffers and can hold the solutions.
         first_solved = first_out if plan is None else first
         second_solved = second_out if plan is None else second
+        solvers = _signal_factors.take(topo, block_values) if cache == "reuse" else None
+        saved = [] if cache == "store" and finite.all() else None
         sweep = _SweepFactorization(matrix)
         for frequency, entries in enumerate(block_values):
-            factor = sweep.factor(entries) if finite[frequency] else None
+            if not finite[frequency]:
+                factor = None
+            elif solvers is not None:
+                factor = solvers[frequency]
+                matrix.data = entries
+            else:
+                factor = sweep.factor(entries)
+            if saved is not None:
+                saved.append(factor)
             if factor is None:
                 failed[frequency] = True
                 continue
@@ -220,6 +271,8 @@ def _solve_signal_systems(topo, values, first_rhs, first_trans, second_rhs, seco
             if has_second:
                 second_solved[frequency] = _solve_refined(matrix, factor, second[frequency], trans=second_trans)
 
+        if saved is not None:
+            _signal_factors.save(topo, block_values, saved)
         if plan is not None:
             # Ignore failed systems during substitutions, then mark the full row invalid.
             first_solved[failed] = 0
@@ -796,6 +849,8 @@ def sparse_simulate_fwd_host(
     car_ch_vals_in,
     sig_ch_vals_in,
     nsv_in,
+    *,
+    save_factors=False,
 ):
     """Run full carrier + signal + quantum-noise sparse forward pass in NumPy/SuperLU."""
     p_base = np.asarray(p_base_in, dtype=np.float64)  # (1, P)
@@ -822,9 +877,14 @@ def sparse_simulate_fwd_host(
     carrier = np.empty((b_car, cn), dtype=np.complex128)
     c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
     car_finite = np.isfinite(car_A).all(axis=1)
+    saved_carrier = [] if save_factors else None
     for bi in range(b_car):
         lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+        if saved_carrier is not None:
+            saved_carrier.append(lu_c)
         carrier[bi] = _solve_refined(c_matrix, lu_c, car_b[bi]) if lu_c is not None else np.nan
+    if saved_carrier is not None:
+        _carrier_factors.save(topo, car_A, saved_carrier)
 
     # --- Signal assembly ---
     if topo.sig_ch_idx.size > 0:
@@ -868,7 +928,10 @@ def sparse_simulate_fwd_host(
     c_sel_full = np.broadcast_to(c_sel, (D, b_sig, sn))
 
     # --- Signal + Adjoint Noise SuperLU solve (1 factorization per freq) ---
-    signal, w = _solve_signal_systems(topo, sig_A, sig_b, "N", np.moveaxis(c_sel_full, 0, -1), "H")
+    signal, w = _solve_signal_systems(
+        topo, sig_A, sig_b, "N", np.moveaxis(c_sel_full, 0, -1), "H",
+        cache="store" if save_factors else "none",
+    )
     w = np.moveaxis(w, -1, 0)
 
     # --- Quantum noise readout: Re(w^H N w) ---
@@ -993,7 +1056,7 @@ def sparse_simulate_bwd_host(
     s_cols = topo.signal_csc_cols
 
     lam_x_all, adjoint = _solve_signal_systems(
-        topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N"
+        topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N", cache="reuse"
     )
     g_c_sel_full = np.moveaxis(np.conj(adjoint), -1, 0)
 
@@ -1062,8 +1125,13 @@ def sparse_simulate_bwd_host(
     c_cols = topo.carrier_csc_cols
     c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
     car_finite = np.isfinite(car_A).all(axis=1)
+    saved_carrier = _carrier_factors.take(topo, car_A)
     for bi in range(b_car):
-        lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+        if saved_carrier is None:
+            lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
+        else:
+            c_matrix.data = car_A[bi]
+            lu_c = saved_carrier[bi]
         if lu_c is None:
             g_car_aug[bi] = np.nan
             continue
