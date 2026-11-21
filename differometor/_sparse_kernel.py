@@ -12,9 +12,12 @@ This module implements:
 
 from __future__ import annotations
 
+from importlib.machinery import EXTENSION_SUFFIXES
+from importlib.metadata import version
+from importlib.util import find_spec, module_from_spec, spec_from_file_location
+from pathlib import Path
+
 import numpy as np
-from scipy.sparse import csc_matrix
-from scipy.sparse.linalg import splu
 import jax
 
 from differometor.components import (
@@ -37,32 +40,133 @@ _SQ_K = 1.0 / (20.0 * np.log10(np.e))
 _NOISE_SCALE = 2.0 * UNIT_VACUUM * H_PLANCK * F0 * 0.25
 
 
-def _factorize(matrix, data):
+def _load_pinned_superlu():
+    """Load the pinned wheel's native solver without eagerly importing SciPy sparse."""
+    try:
+        if version("scipy") != "1.18.1":
+            return None
+        scipy = find_spec("scipy")
+        if scipy is None or scipy.origin is None:
+            return None
+        directory = Path(scipy.origin).parent / "sparse" / "linalg" / "_dsolve"
+        for suffix in EXTENSION_SUFFIXES:
+            binary = directory / f"_superlu{suffix}"
+            if binary.is_file():
+                spec = spec_from_file_location("_superlu", binary)
+                if spec is None or spec.loader is None:
+                    continue
+                module = module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return getattr(module, "gstrf", None)
+    except (ImportError, OSError):
+        return None
+    return None
+
+
+_gstrf = _load_pinned_superlu()
+
+
+def _make_sparse_matrix(*args, **kwargs):
+    from scipy.sparse import csc_matrix
+
+    return csc_matrix(*args, **kwargs)
+
+
+def _factorize(matrix, data, *, ordering="COLAMD"):
     """Return no factor for a singular optical system, matching the dense solve."""
     matrix.data = data
     try:
-        return splu(matrix, permc_spec="COLAMD", diag_pivot_thresh=1.0)
+        if _gstrf is not None:
+            return _gstrf(
+                matrix.shape[0], data.size, data, matrix.indices, matrix.indptr,
+                ilu=False, options={"ColPerm": ordering, "DiagPivotThresh": 1.0},
+                csc_construct_func=_make_sparse_matrix,
+            )
+        from scipy.sparse.linalg import splu
+
+        csc = _make_sparse_matrix((data, matrix.indices, matrix.indptr), shape=matrix.shape)
+        return splu(csc, permc_spec=ordering, diag_pivot_thresh=1.0)
     except RuntimeError as error:
         if "singular" not in str(error).lower():
             raise
         return None
 
 
-def _csc_workspace(size, indices, indptr):
-    """Construct the CSC structure once per callback and replace its numeric values per row."""
-    data = np.empty(indices.size, dtype=np.complex128)
-    return csc_matrix((data, indices, indptr), shape=(size, size))
+class _CSCWorkspace:
+    """Keep a sparsity pattern and apply the current matrix when refining a solve."""
+
+    def __init__(self, size, indices, indptr):
+        self.shape = (size, size)
+        self.indices = indices
+        self.indptr = indptr
+        self._row_order = None
+
+    def multiply(self, values, trans):
+        if self._row_order is None:
+            size = self.shape[0]
+            self._row_order = np.argsort(self.indices, kind="stable")
+            self._cols_in_row_order = np.repeat(np.arange(size), np.diff(self.indptr))[self._row_order]
+            counts = np.bincount(self.indices, minlength=size)
+            self._rows_with_terms = np.flatnonzero(counts)
+            self._row_starts = (np.cumsum(counts) - counts)[self._rows_with_terms]
+            self._cols_with_terms = np.flatnonzero(np.diff(self.indptr))
+
+        if trans == "N":
+            data = self.data[self._row_order]
+            picked = values[self._cols_in_row_order]
+            starts = self._row_starts
+            filled = self._rows_with_terms
+        else:
+            data = np.conj(self.data) if trans == "H" else self.data
+            picked = values[self.indices]
+            starts = self.indptr[self._cols_with_terms]
+            filled = self._cols_with_terms
+        product = np.zeros_like(values)
+        if filled.size:
+            terms = data * picked if values.ndim == 1 else data[:, None] * picked
+            product[filled] = np.add.reduceat(terms, starts, axis=0)
+        return product
+
+
+class _SweepFactorization:
+    """Reuse the first successful column ordering within a single sweep."""
+
+    def __init__(self, matrix):
+        self.matrix = matrix
+        self.order = None
+
+    def factor(self, values):
+        self.matrix.data = values
+        if self.order is None:
+            factors = _factorize(self.matrix, values)
+            if factors is not None:
+                self.order = np.argsort(factors.perm_c)
+                self.inverse_order = factors.perm_c
+                lengths = np.diff(self.matrix.indptr)[self.order]
+                pointers = np.empty_like(self.matrix.indptr)
+                pointers[0] = 0
+                np.cumsum(lengths, out=pointers[1:])
+                offsets = self.matrix.indptr[self.order] - pointers[:-1]
+                self.positions = np.repeat(offsets, lengths) + np.arange(values.size)
+                rows = self.matrix.indices[self.positions]
+                self.reordered = _CSCWorkspace(self.matrix.shape[0], rows, pointers)
+            return factors
+
+        self.factors = _factorize(self.reordered, values[self.positions], ordering="NATURAL")
+        if self.factors is None:
+            return _factorize(self.matrix, values)
+        return self
+
+    def solve(self, rhs, trans="N"):
+        if trans == "N":
+            return self.factors.solve(rhs)[self.inverse_order]
+        return self.factors.solve(rhs[self.order], trans=trans)
 
 
 def _solve_refined(matrix, factors, rhs, trans="N"):
     """Correct the solve residual in float64 using the existing LU factors."""
     solution = factors.solve(rhs, trans=trans)
-    if trans == "N":
-        residual = rhs - matrix @ solution
-    elif trans == "T":
-        residual = rhs - matrix.T @ solution
-    else:
-        residual = rhs - np.conj(matrix.T @ np.conj(solution))
+    residual = rhs - matrix.multiply(solution, trans)
     return solution + factors.solve(residual, trans=trans)
 
 
@@ -634,7 +738,7 @@ def sparse_simulate_fwd_host(
     car_b = car_aug[:, nnz_c:]
 
     carrier = np.empty((b_car, cn), dtype=np.complex128)
-    c_matrix = _csc_workspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
+    c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
     car_finite = np.isfinite(car_A).all(axis=1)
     for bi in range(b_car):
         lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None
@@ -681,10 +785,11 @@ def sparse_simulate_fwd_host(
     # --- Signal + Adjoint Noise SuperLU solve (1 factorization per freq) ---
     signal = np.empty((b_sig, sn), dtype=np.complex128)
     w = np.empty((D, b_sig, sn), dtype=np.complex128)
-    s_matrix = _csc_workspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+    s_matrix = _CSCWorkspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+    sweep_factors = _SweepFactorization(s_matrix)
     sig_finite = np.isfinite(sig_A).all(axis=1)
     for bi in range(b_sig):
-        lu_s = _factorize(s_matrix, sig_A[bi]) if sig_finite[bi] else None
+        lu_s = sweep_factors.factor(sig_A[bi]) if sig_finite[bi] else None
         if lu_s is None:
             signal[bi] = np.nan
             w[:, bi] = np.nan
@@ -808,13 +913,14 @@ def sparse_simulate_bwd_host(
     g_sig_aug = np.empty((b_sig, nnz_s + sn), dtype=np.complex128)
     g_c_sel_full = np.zeros((D, b_sig, sn), dtype=np.complex128)
     lam_x_all = np.empty((b_sig, sn), dtype=np.complex128)
-    s_matrix = _csc_workspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+    s_matrix = _CSCWorkspace(sn, topo.signal_csc_indices, topo.signal_csc_indptr)
+    sweep_factors = _SweepFactorization(s_matrix)
     s_rows = topo.signal_csc_rows
     s_cols = topo.signal_csc_cols
 
     sig_finite = np.isfinite(sig_A).all(axis=1)
     for bi in range(b_sig):
-        lu_s = _factorize(s_matrix, sig_A[bi]) if sig_finite[bi] else None
+        lu_s = sweep_factors.factor(sig_A[bi]) if sig_finite[bi] else None
         if lu_s is None:
             lam_x_all[bi] = np.nan
             g_c_sel_full[:, bi] = np.nan
@@ -888,7 +994,7 @@ def sparse_simulate_bwd_host(
     g_car_aug = np.empty((b_car, nnz_c + cn), dtype=np.complex128)
     c_rows = topo.carrier_csc_rows
     c_cols = topo.carrier_csc_cols
-    c_matrix = _csc_workspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
+    c_matrix = _CSCWorkspace(cn, topo.carrier_csc_indices, topo.carrier_csc_indptr)
     car_finite = np.isfinite(car_A).all(axis=1)
     for bi in range(b_car):
         lu_c = _factorize(c_matrix, car_A[bi]) if car_finite[bi] else None

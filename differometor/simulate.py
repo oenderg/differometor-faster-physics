@@ -109,8 +109,8 @@ def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind
     D = topo.num_detectors
 
     specs = (
-        jax.ShapeDtypeStruct((b_car, topo.cn), jnp.complex128),
-        jax.ShapeDtypeStruct((b_sig, topo.sn), jnp.complex128),
+        jax.ShapeDtypeStruct((topo.cn, b_car), jnp.complex128),
+        jax.ShapeDtypeStruct((topo.sn, b_sig), jnp.complex128),
         jax.ShapeDtypeStruct((D, b_sig), jnp.float64),
         jax.ShapeDtypeStruct((b_car, topo.nnz_c), jnp.complex128),
         jax.ShapeDtypeStruct((b_sig, topo.nnz_s), jnp.complex128),
@@ -124,8 +124,9 @@ def _sparse_forward(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, topo, bind
 
     def _call(opt, base, car_sweep, sig_sweep, vectors):
         bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
-        results = sparse_simulate_fwd_host(topo, bound, car_sweep, sig_sweep, vectors)
-        return results if save_residuals else results[:3]
+        carrier, signal, noise, *residuals = sparse_simulate_fwd_host(topo, bound, car_sweep, sig_sweep, vectors)
+        outputs = (carrier.T, signal.T, noise)
+        return (*outputs, *residuals) if save_residuals else outputs
 
     return jax.pure_callback(
         _call, specs, optimized, p_base, car_ch_vals, sig_ch_vals, nsv, vmap_method="sequential"
@@ -141,9 +142,13 @@ def _sparse_simulate_core_fwd(optimized, p_base, car_ch_vals, sig_ch_vals, nsv, 
 def _sparse_simulate_core_bwd(topo, bind_parameters, res, g):
     specs = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in res[:5])
 
-    def _call_bwd(opt, base, *values):
+    def _call_bwd(opt, base, car_sweep, sig_sweep, vectors, carrier, signal, noise, *values):
         bound = _insert_optimized_parameters(base, opt, topo, bind_parameters)
-        g_base, *rest = sparse_simulate_bwd_host(topo, bound, *values)
+        *residuals, g_carrier, g_signal, g_noise = values
+        g_base, *rest = sparse_simulate_bwd_host(
+            topo, bound, car_sweep, sig_sweep, vectors, np.asarray(carrier).T, np.asarray(signal).T, noise,
+            *residuals, np.asarray(g_carrier).T, np.asarray(g_signal).T, g_noise,
+        )
         g_opt = np.zeros(opt.shape, dtype=g_base.dtype)
         if bind_parameters:
             indices = topo.opt_param_idx
@@ -210,7 +215,7 @@ def simulate(
         topology,
         bind_parameters,
     )
-    return carrier.T, signal.T, noise.squeeze()
+    return carrier, signal, noise.squeeze()
 
 
 def run_build_step(

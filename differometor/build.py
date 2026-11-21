@@ -1432,10 +1432,10 @@ def build(setup: Setup, as_jax: bool = True):
                 np.array(indices_to_link, dtype=np.int32),
             ),
             (
-                jnp.array(detector_indices, dtype=int),
-                jnp.array(mirror_indices, dtype=int),
-                jnp.array(beamsplitter_indices, dtype=int),
-                jnp.array(isolator_indices, dtype=int),
+                jnp.asarray(np.asarray(detector_indices, dtype=np.int64)),
+                jnp.asarray(np.asarray(mirror_indices, dtype=np.int64)),
+                jnp.asarray(np.asarray(beamsplitter_indices, dtype=np.int64)),
+                jnp.asarray(np.asarray(isolator_indices, dtype=np.int64)),
                 port_to_index,
             ),
         )
