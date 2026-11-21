@@ -34,8 +34,11 @@ to match phase conventions and signs.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.extend import core
+from jax.interpreters import ad, batching, mlir
 
 
 # -----------------------------------------------------------------------------
@@ -851,9 +854,123 @@ def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
     Matches:
     finesse > detectors > compute > power.pyx > c_pd1_AC_output
     """
-    upper_sideband = jnp.conj(carrier) * signal[: carrier.shape[0]]
-    lower_sideband = carrier * signal[carrier.shape[0] : carrier.shape[0] * 2]
+    if (
+        not jax.config.x64_enabled
+        or getattr(carrier, "dtype", None) != np.complex128
+        or getattr(signal, "dtype", None) != np.complex128
+        or getattr(carrier, "weak_type", False)
+        or getattr(signal, "weak_type", False)
+        or not carrier.ndim
+        or not signal.ndim
+        or not all(isinstance(size, int) for size in (*carrier.shape, *signal.shape))
+        or signal.shape[0] < 2 * carrier.shape[0]
+    ):
+        return _demodulate_fields(jnp, carrier, signal)
+    return _signal_detector_callback(carrier, signal)
+
+
+def _demodulate_fields(xp, carrier, signal):
+    ports = carrier.shape[0]
+    upper_sideband = xp.conj(carrier) * signal[:ports]
+    lower_sideband = carrier * signal[ports : 2 * ports]
     return upper_sideband + lower_sideband
+
+
+def _sum_broadcast_cotangent(xp, cotangent, shape):
+    leading = cotangent.ndim - len(shape)
+    axes = tuple(range(leading)) + tuple(
+        axis for axis, size in enumerate(shape, leading)
+        if size == 1 and cotangent.shape[axis] != 1
+    )
+    return xp.sum(cotangent, axis=axes, keepdims=True).reshape(shape) if axes else cotangent
+
+
+def _signal_detector_cotangents(xp, carrier, signal, weight):
+    ports = carrier.shape[0]
+    upper, lower = signal[:ports], signal[ports : 2 * ports]
+    upper_carrier = _sum_broadcast_cotangent(xp, xp.conj(weight * upper), carrier.shape)
+    lower_carrier = _sum_broadcast_cotangent(xp, weight * lower, carrier.shape)
+    upper_signal = _sum_broadcast_cotangent(xp, weight * xp.conj(carrier), upper.shape)
+    lower_signal = _sum_broadcast_cotangent(xp, weight * carrier, lower.shape)
+    signal_cotangent = xp.concatenate((upper_signal, lower_signal, xp.zeros_like(signal[2 * ports :])))
+    return upper_carrier + lower_carrier, signal_cotangent
+
+
+def _signal_detector_host(carrier, signal):
+    return _demodulate_fields(np, np.asarray(carrier), np.asarray(signal))
+
+
+def _signal_detector_cotangents_host(carrier, signal, weight):
+    return _signal_detector_cotangents(np, np.asarray(carrier), np.asarray(signal), np.asarray(weight))
+
+
+@jax.custom_jvp
+def _signal_detector_pullback(carrier, signal, weight):
+    specs = tuple(jax.ShapeDtypeStruct(field.shape, field.dtype) for field in (carrier, signal))
+    return jax.pure_callback(
+        _signal_detector_cotangents_host, specs, carrier, signal, weight, vmap_method="sequential"
+    )
+
+
+@_signal_detector_pullback.defjvp
+def _signal_detector_pullback_jvp(primals, tangents):
+    _, tangent = jax.jvp(lambda *fields: _signal_detector_cotangents(jnp, *fields), primals, tangents)
+    return _signal_detector_pullback(*primals), tangent
+
+
+def _signal_detector_tangent(carrier, signal, carrier_tangent, signal_tangent):
+    return _demodulate_fields(jnp, carrier, signal_tangent) + _demodulate_fields(jnp, carrier_tangent, signal)
+
+
+def _signal_detector_shape(carrier, signal):
+    sideband_shape = (carrier.shape[0], *signal.shape[1:])
+    return np.broadcast_shapes(carrier.shape, sideband_shape)
+
+
+def _signal_detector_tangent_aval(carrier, signal, *_):
+    return jax.core.ShapedArray(_signal_detector_shape(carrier, signal), carrier.dtype)
+
+
+def _signal_detector_transpose(weight, carrier, signal, carrier_tangent, signal_tangent):
+    if isinstance(weight, ad.Zero):
+        return None, None, None, None
+    carrier_weight, signal_weight = _signal_detector_pullback(carrier, signal, weight)
+    return (
+        None,
+        None,
+        carrier_weight if ad.is_undefined_primal(carrier_tangent) else None,
+        signal_weight if ad.is_undefined_primal(signal_tangent) else None,
+    )
+
+
+def _signal_detector_tangent_jvp(primals, tangents):
+    return jax.jvp(_signal_detector_tangent, primals, tuple(map(ad.instantiate_zeros, tangents)))
+
+
+def _signal_detector_tangent_batch(args, axes):
+    return jax.vmap(_signal_detector_tangent, in_axes=axes)(*args), 0
+
+
+# Keep the tangent terms together so reverse mode can return both cotangents
+# in a single callback. The JAX tangent also supports higher derivatives.
+_signal_tangent = core.Primitive("differometor_signal_tangent")
+_signal_tangent.def_impl(_signal_detector_tangent)
+_signal_tangent.def_abstract_eval(_signal_detector_tangent_aval)
+mlir.register_lowering(_signal_tangent, mlir.lower_fun(_signal_detector_tangent, multiple_results=False))
+ad.primitive_transposes[_signal_tangent] = _signal_detector_transpose
+ad.primitive_jvps[_signal_tangent] = _signal_detector_tangent_jvp
+batching.primitive_batchers[_signal_tangent] = _signal_detector_tangent_batch
+
+
+@jax.custom_jvp
+def _signal_detector_callback(carrier, signal):
+    spec = jax.ShapeDtypeStruct(_signal_detector_shape(carrier, signal), carrier.dtype)
+    return jax.pure_callback(_signal_detector_host, spec, carrier, signal, vmap_method="sequential")
+
+
+@_signal_detector_callback.defjvp
+def _signal_detector_callback_jvp(primals, tangents):
+    return _signal_detector_callback(*primals), _signal_tangent.bind(*primals, *tangents)
 
 
 # -----------------------------------------------------------------------------
