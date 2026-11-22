@@ -1718,6 +1718,8 @@ def _has_near_null_readout(topo, carrier, signal):
     ports = topo.readout_ports
     if not ports.size:
         return False
+    # A lower-sideband detector's index points into the signal vector (cn + port): check its port.
+    ports = np.where(ports >= topo.cn, ports - topo.cn, ports)
     fields = carrier[:, ports]
     upper = fields.conj() * signal[:, ports]
     lower = fields * signal[:, topo.cn + ports]
