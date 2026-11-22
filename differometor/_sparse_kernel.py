@@ -486,6 +486,11 @@ def _solve_signal_systems(
         first_solved = first_out if plan is None else first
         second_solved = second_out if plan is None else second
         solvers = _signal_factors.take(topo, block_values) if cache == "reuse" else None
+        if not allow_batches and isinstance(solvers, _SweepBatches):
+            # An interleaved call can leave batched factors for the same matrix.
+            # A near-null readout must retain the independent solve's rounding,
+            # including when factors would otherwise be reusable.
+            solvers = None
         # A block diagonal factor is equivalent to independent systems.
         blocks = solvers if isinstance(solvers, _SweepBatches) else None
         if allow_batches and solvers is None and len(block_values) > 1 and finite.all() and matrix.indices.size and _allows_frequency_batches(topo):
