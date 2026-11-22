@@ -40,7 +40,7 @@ _SQ_K = 1.0 / (20.0 * np.log10(np.e))
 _NOISE_SCALE = 2.0 * UNIT_VACUUM * H_PLANCK * F0 * 0.25
 
 
-def _load_pinned_superlu():
+def _load_pinned_sparse_extension(name, *subdirectories):
     """Load the pinned wheel's native solver without eagerly importing SciPy sparse."""
     try:
         scipy = find_spec("scipy")
@@ -52,22 +52,25 @@ def _load_pinned_superlu():
         # to the public SciPy import, which gives bit-identical results.
         if not (package.parent / "scipy-1.18.1.dist-info").is_dir():
             return None
-        directory = package / "sparse" / "linalg" / "_dsolve"
+        directory = package.joinpath("sparse", *subdirectories)
         for suffix in EXTENSION_SUFFIXES:
-            binary = directory / f"_superlu{suffix}"
+            binary = directory / f"{name}{suffix}"
             if binary.is_file():
-                spec = spec_from_file_location("_superlu", binary)
+                spec = spec_from_file_location(name, binary)
                 if spec is None or spec.loader is None:
                     continue
                 module = module_from_spec(spec)
                 spec.loader.exec_module(module)
-                return getattr(module, "gstrf", None)
+                return module
     except (ImportError, OSError):
         return None
     return None
 
 
-_gstrf = _load_pinned_superlu()
+_gstrf = getattr(_load_pinned_sparse_extension("_superlu", "linalg", "_dsolve"), "gstrf", None)
+_sparsetools = _load_pinned_sparse_extension("_sparsetools")
+_csr_matvec = getattr(_sparsetools, "csr_matvec", None)
+_csr_matvecs = getattr(_sparsetools, "csr_matvecs", None)
 _LU_PANEL_SIZE = 4
 _LU_RELAX = 2
 
@@ -78,7 +81,7 @@ def _make_sparse_matrix(*args, **kwargs):
     return csc_matrix(*args, **kwargs)
 
 
-def _factorize(matrix, data, *, ordering="COLAMD"):
+def _factorize(matrix, data, *, ordering="COLAMD", panel_size=_LU_PANEL_SIZE, relax=_LU_RELAX):
     """Return no factor for a singular optical system, matching the dense solve."""
     matrix.data = data
     try:
@@ -89,15 +92,15 @@ def _factorize(matrix, data, *, ordering="COLAMD"):
                 options={
                     "ColPerm": ordering,
                     "DiagPivotThresh": 1.0,
-                    "PanelSize": _LU_PANEL_SIZE,
-                    "Relax": _LU_RELAX,
+                    "PanelSize": panel_size,
+                    "Relax": relax,
                 },
                 csc_construct_func=_make_sparse_matrix,
             )
         from scipy.sparse.linalg import splu
 
         csc = _make_sparse_matrix((data, matrix.indices, matrix.indptr), shape=matrix.shape)
-        return splu(csc, permc_spec=ordering, diag_pivot_thresh=1.0, panel_size=_LU_PANEL_SIZE, relax=_LU_RELAX)
+        return splu(csc, permc_spec=ordering, diag_pivot_thresh=1.0, panel_size=panel_size, relax=relax)
     except RuntimeError as error:
         if "singular" not in str(error).lower():
             raise
@@ -216,10 +219,10 @@ class _SweepFactorization:
         self.matrix = matrix
         self.order = None
 
-    def factor(self, values):
+    def factor(self, values, *, first_ordering="COLAMD"):
         self.matrix.data = values
         if self.order is None:
-            factors = _factorize(self.matrix, values)
+            factors = _factorize(self.matrix, values, ordering=first_ordering)
             if factors is not None:
                 self.order = np.argsort(factors.perm_c)
                 self.inverse_order = factors.perm_c
@@ -312,8 +315,144 @@ _signal_factors = _ForwardFactors()
 _carrier_factors = _ForwardFactors()
 
 
+_FREQUENCIES_AT_ONCE = 16
+
+
+class _SweepBatches:
+    """Factored block-diagonal groups of independent frequency systems."""
+
+    def __init__(self, matrix, values):
+        ordering = _SweepFactorization(matrix)
+        # MMD_ATA can crash inside SuperLU on structurally singular matrices.
+        # A present diagonal in every column is a sufficient structural guard.
+        columns = np.repeat(np.arange(matrix.shape[0]), np.diff(matrix.indptr))
+        diagonal = np.unique(matrix.indices[matrix.indices == columns])
+        strategy = "MMD_ATA" if diagonal.size == matrix.shape[0] else "COLAMD"
+        first = ordering.factor(values[0], first_ordering=strategy)
+        if first is None:
+            raise ValueError("first system is singular")
+        width = matrix.shape[0]
+        cols = ordering.reordered.indices
+        ptr = ordering.reordered.indptr
+        nnz = cols.size
+        # Limit the native factor's working set as the optical core grows.
+        size = min(_FREQUENCIES_AT_ONCE, 12288 // width, 65536 // nnz)
+        if size < 2:
+            raise ValueError("systems are too large to batch")
+        self.batch_size = size
+        block_cols = cols + np.arange(size, dtype=cols.dtype)[:, None] * width
+        block_ptr = ptr[:-1] + np.arange(size, dtype=ptr.dtype)[:, None] * nnz
+        permuted = np.ascontiguousarray(values[1:, ordering.positions])
+        factor_patterns = {}
+        self.groups = []
+        self.first = first
+        self.order = ordering.order
+        self.inverse_order = ordering.inverse_order
+        for start in range(1, len(values), size):
+            stop = min(start + size, len(values))
+            count = stop - start
+            if count not in factor_patterns:
+                pointers = np.empty(count * width + 1, dtype=ptr.dtype)
+                pointers[:-1] = block_ptr[:count].ravel()
+                pointers[-1] = count * nnz
+                factor_patterns[count] = _CSCWorkspace(count * width, block_cols[:count].ravel(), pointers)
+            workspace = factor_patterns[count]
+            entries = permuted[start-1:stop-1].ravel()
+            lu = _factorize(workspace, entries, ordering="NATURAL", panel_size=1, relax=1)
+            if lu is None:
+                raise ValueError("block contains a singular system")
+            self.groups.append((slice(start,stop),lu))
+
+    def refine_into(self, matrix, entries, rhs, trans, output):
+        matrix.data = entries[0]
+        output[0] = _solve_refined(matrix, self.first, rhs[0], trans=trans)
+        pattern = matrix.pattern
+        pattern.ensure_ready()
+        n = matrix.shape[0]
+        order = self.order
+        inverse = self.inverse_order
+        if trans == "N":
+            coefficient_order = pattern.row_order
+            pick = inverse[pattern.cols_in_row_order]
+            starts = pattern.row_starts
+            filled = pattern.rows_with_terms
+        else:
+            pick = matrix.indices
+            starts = matrix.indptr[pattern.cols_with_terms]
+            filled = pattern.cols_with_terms
+        if _csr_matvec is not None and (_csr_matvecs is not None or rhs.ndim == 2):
+            if trans == "N":
+                counts = np.bincount(matrix.indices, minlength=n)
+                indptr = np.empty(n + 1, dtype=matrix.indptr.dtype)
+                indptr[0] = 0
+                np.cumsum(counts, out=indptr[1:])
+            else:
+                indptr = matrix.indptr
+            nnz = len(pick)
+            block_cols = pick.astype(matrix.indices.dtype, copy=False) + np.arange(self.batch_size, dtype=matrix.indices.dtype)[:, None] * n
+            block_starts = indptr[:-1] + np.arange(self.batch_size, dtype=indptr.dtype)[:, None] * nnz
+            structures = {}
+        else:
+            structures = None
+        for part, lu in self.groups:
+            current = rhs[part]
+            shape = current.shape
+            flat_shape = (shape[0] * n,) + shape[2:]
+            if trans != "N":
+                current = current[:, order]
+            solution = lu.solve(current.reshape(flat_shape), trans=trans).reshape(shape)
+            coefs = entries[part]
+            if trans == "N":
+                coefs = coefs[:, coefficient_order]
+            elif trans == "H":
+                coefs = coefs.conj()
+            if structures is None:
+                selected = solution[:, pick]
+                if len(shape) == 3:
+                    coefs = coefs[..., None]
+                selected *= coefs
+                dot = np.add.reduceat(selected, starts, axis=1)
+                if filled.size != n:
+                    product = np.zeros_like(solution)
+                    product[:, filled] = dot
+                    dot = product
+            else:
+                count = shape[0]
+                m = n * count
+                if count not in structures:
+                    ptr = np.empty(m + 1, dtype=indptr.dtype)
+                    ptr[:-1] = block_starts[:count].reshape(-1)
+                    ptr[-1] = nnz * count
+                    structures[count] = ptr, block_cols[:count].reshape(-1)
+                ptr, cols = structures[count]
+                dot = np.zeros(shape, dtype=solution.dtype)
+                x = np.ascontiguousarray(solution).reshape(-1)
+                coef = np.ascontiguousarray(coefs).reshape(-1)
+                if len(shape) == 2:
+                    _csr_matvec(m, m, ptr, cols, coef, x, dot.reshape(-1))
+                else:
+                    _csr_matvecs(m, m, shape[2], ptr, cols, coef, x, dot.reshape(-1))
+            if trans != "N":
+                dot = dot[:, order]
+            np.subtract(current, dot, out=dot)
+            solution += lu.solve(dot.reshape(flat_shape), trans=trans).reshape(shape)
+            output[part] = solution[:, inverse] if trans == "N" else solution
+
+
+def _allows_frequency_batches(topo):
+    # Laser frequency modulation subtracts sidebands that can cancel almost
+    # completely at a detector. Keep the original evaluation order for these
+    # optical sources; grouping changes floating-point roundoff near the null.
+    frequency_modulation = (11, 18)
+    return not any(
+        group.f_idx in frequency_modulation
+        for groups in (topo.signal_groups_static, topo.signal_groups_sweep)
+        for group in groups
+    )
+
+
 def _solve_signal_systems(
-    topo, values, first_rhs, first_trans, second_rhs, second_trans, *, cache="none", copy_second=True
+    topo, values, first_rhs, first_trans, second_rhs, second_trans, *, cache="none", copy_second=True, allow_batches=True
 ):
     """Factor the coupled block once per frequency for both right-hand sides."""
     plan = topo.signal_block_plan
@@ -347,27 +486,41 @@ def _solve_signal_systems(
         first_solved = first_out if plan is None else first
         second_solved = second_out if plan is None else second
         solvers = _signal_factors.take(topo, block_values) if cache == "reuse" else None
-        saved = [] if cache == "store" and finite.all() else None
-        sweep = _SweepFactorization(matrix)
-        for frequency, entries in enumerate(block_values):
-            if not finite[frequency]:
-                factor = None
-            elif solvers is not None:
-                factor = solvers[frequency]
-                matrix.data = entries
-            else:
-                factor = sweep.factor(entries)
-            if saved is not None:
-                saved.append(factor)
-            if factor is None:
-                failed[frequency] = True
-                continue
-            first_solved[frequency] = _solve_refined(matrix, factor, first[frequency], trans=first_trans)
+        # A block diagonal factor is equivalent to independent systems.
+        blocks = solvers if isinstance(solvers, _SweepBatches) else None
+        if allow_batches and solvers is None and len(block_values) > 1 and finite.all() and matrix.indices.size and _allows_frequency_batches(topo):
+            try:
+                blocks = _SweepBatches(matrix, block_values)
+            except ValueError:
+                pass
+        if blocks is not None:
+            blocks.refine_into(matrix, block_values, first, first_trans, first_solved)
             if has_second:
-                second_solved[frequency] = _solve_refined(matrix, factor, second[frequency], trans=second_trans)
+                blocks.refine_into(matrix, block_values, second, second_trans, second_solved)
+            if cache == "store":
+                _signal_factors.save(topo, block_values, blocks)
+        else:
+            saved = [] if cache == "store" and finite.all() else None
+            sweep = _SweepFactorization(matrix)
+            for frequency, entries in enumerate(block_values):
+                if not finite[frequency]:
+                    factor = None
+                elif solvers is not None:
+                    factor = solvers[frequency]
+                    matrix.data = entries
+                else:
+                    factor = sweep.factor(entries)
+                if saved is not None:
+                    saved.append(factor)
+                if factor is None:
+                    failed[frequency] = True
+                    continue
+                first_solved[frequency] = _solve_refined(matrix, factor, first[frequency], trans=first_trans)
+                if has_second:
+                    second_solved[frequency] = _solve_refined(matrix, factor, second[frequency], trans=second_trans)
 
-        if saved is not None:
-            _signal_factors.save(topo, block_values, saved)
+            if saved is not None:
+                _signal_factors.save(topo, block_values, saved)
         if plan is not None:
             # Ignore failed systems during substitutions, then mark the full row invalid.
             first_solved[failed] = 0
@@ -1381,7 +1534,7 @@ class SparseTopology:
     """Immutable host-side sparse topology passed as static JAX pytree aux_data."""
 
     __slots__ = (
-        "cn", "sn", "nnz_c", "nnz_s", "nnz_n", "num_detectors",
+        "cn", "sn", "nnz_c", "nnz_s", "nnz_n", "num_detectors", "readout_ports",
         "opt_param_idx", "opt_val_idx",
         "car_ch_idx", "sig_ch_idx",
         "qhd_param_idx", "qhd_placing_idx", "qhd_scatter_plan",
@@ -1560,6 +1713,28 @@ def _accumulate_sweep_vjp(g_parent, g_expanded, indices, sweep_values):
 # Full Sparse Forward + Exact Reverse-Mode VJP Host Callbacks
 # -----------------------------------------------------------------------------
 
+def _has_near_null_readout(topo, carrier, signal):
+    """Detect loss of significance in the optical demodulation of declared ports."""
+    ports = topo.readout_ports
+    if not ports.size:
+        return False
+    fields = carrier[:, ports]
+    upper = fields.conj() * signal[:, ports]
+    lower = fields * signal[:, topo.cn + ports]
+    readout = upper + lower
+    scale = np.abs(upper) + np.abs(lower)
+    limit = 1e-7
+    for i in range(ports.size):
+        if np.any(np.abs(readout[:, i]) < limit * scale[:, i]):
+            return True
+        if i:
+            difference = readout[:, :i] - readout[:, i:i+1]
+            pair_scale = scale[:, :i] + scale[:, i:i+1]
+            if np.any(np.abs(difference) < limit * pair_scale):
+                return True
+    return False
+
+
 def sparse_simulate_fwd_host(
     topo: SparseTopology,
     p_base_in,
@@ -1657,18 +1832,14 @@ def sparse_simulate_fwd_host(
     c_sel_full = np.broadcast_to(c_sel, (D, b_sig, sn))
 
     # --- Signal + Adjoint Noise SuperLU solve (1 factorization per freq) ---
-    if D == 1:
-        signal, w_2d = _solve_signal_systems(
-            topo, sig_A, sig_b, "N", c_sel_full[0], "H",
-            cache="store" if save_factors else "none",
-        )
-        w = w_2d[None, :, :]
-    else:
+    noise_rhs = c_sel_full[0] if D == 1 else np.moveaxis(c_sel_full, 0, -1)
+    cache_mode = "store" if save_factors else "none"
+    signal, w = _solve_signal_systems(topo, sig_A, sig_b, "N", noise_rhs, "H", cache=cache_mode)
+    if b_sig > 1 and _allows_frequency_batches(topo) and _has_near_null_readout(topo, carrier, signal):
         signal, w = _solve_signal_systems(
-            topo, sig_A, sig_b, "N", np.moveaxis(c_sel_full, 0, -1), "H",
-            cache="store" if save_factors else "none",
+            topo, sig_A, sig_b, "N", noise_rhs, "H", cache=cache_mode, allow_batches=False,
         )
-        w = np.moveaxis(w, -1, 0)
+    w = w[None, :, :] if D == 1 else np.moveaxis(w, -1, 0)
 
     # --- Quantum noise readout: Re(w^H N w) ---
     n_vals = np.broadcast_to(topo.noise_base_vals[None, :], (b_car, topo.nnz_n)).copy()
@@ -1790,16 +1961,17 @@ def sparse_simulate_bwd_host(
 
     if signal_used or noise_used:
         # 2. Backprop through SuperLU signal + adjoint noise solve
+        allow_batches = not _has_near_null_readout(topo, carrier, signal)
         if D == 1:
             bwd_second_rhs = np.conj(g_w[0])
             lam_x_all, adjoint_2d = _solve_signal_systems(
-                topo, sig_A, g_signal, "T", bwd_second_rhs, "N", cache="reuse", copy_second=False
+                topo, sig_A, g_signal, "T", bwd_second_rhs, "N", cache="reuse", copy_second=False, allow_batches=allow_batches
             )
             np.conj(adjoint_2d, out=adjoint_2d)
             g_c_sel_full = adjoint_2d[None, :, :]
         else:
             lam_x_all, adjoint = _solve_signal_systems(
-                topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N", cache="reuse", copy_second=False
+                topo, sig_A, g_signal, "T", np.moveaxis(np.conj(g_w), 0, -1), "N", cache="reuse", copy_second=False, allow_batches=allow_batches
             )
             g_c_sel_full = np.moveaxis(np.conj(adjoint), -1, 0)
 

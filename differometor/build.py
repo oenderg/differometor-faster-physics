@@ -2353,6 +2353,7 @@ def build_sparse_simulation_arrays(
 
     topology = SparseTopology(
         cn=cn,
+        readout_ports=np.asarray(metadata[0], dtype=np.intp),
         sn=sn,
         nnz_c=c_nnz,
         nnz_s=s_nnz,
