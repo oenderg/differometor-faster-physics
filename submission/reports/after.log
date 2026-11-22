@@ -1,0 +1,35 @@
+Initialize CPU backend: 0.001685 s
+CPU: 13th Gen Intel(R) Core(TM) i7-13700K; affinity: 1; devices: [CpuDevice(id=0)]
+Read and parse public inputs: 0.001170 s
+Build optical setup and prepare inputs: 0.037967 s
+Workload: 101 frequencies; 193 physical design variables; no optimizer
+Forward: trace / lower: 0.004434 s
+Forward: compile: 0.004009 s
+Forward simulation + AD residuals: 0.042017 s
+Sensitivity: trace / lower: 0.018229 s
+Sensitivity: compile: 0.099863 s
+Sensitivity, powers and scalar loss: 0.001544 s
+Gradient: trace / lower: 0.006747 s
+Gradient: compile: 0.042884 s
+Reverse-mode gradient: 0.052733 s
+Transfer results to host: 0.000132 s
+Complete first-run total (excluding validation): 0.507822 s
+Forward: 0.038073 s
+Sensitivity: 0.000992 s
+Gradient: 0.050395 s
+Host transfer: 0.000105 s
+Repeat 01/3: 0.089566 s
+Forward: 0.039066 s
+Sensitivity: 0.000586 s
+Gradient: 0.047883 s
+Host transfer: 0.000085 s
+Repeat 02/3: 0.087620 s
+Forward: 0.039552 s
+Sensitivity: 0.000833 s
+Gradient: 0.048923 s
+Host transfer: 0.000085 s
+Repeat 03/3: 0.089394 s
+Validating outputs, reference sensitivity and finite-difference gradient...
+PASS: reference sensitivity and gradient spot check; full runtime median 0.089394 s
+JSON: ./after.json
+Plot: ./after.png
