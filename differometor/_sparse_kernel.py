@@ -745,7 +745,7 @@ def _vjp_1(args, gy):  # laser
     amp = np.sqrt(2.0 * power / EPSILON_0C)
     e = np.exp(1j * (phase * _DEG))
     y = amp * e
-    inv_amp = np.where(amp > 0.0, 1.0 / np.where(amp > 0.0, amp, 1.0), 0.0)
+    inv_amp = np.where(amp > 0.0, 1.0 / np.where(amp > 0.0, amp, 1.0), np.nan)
     return (
         np.real(gy * e) * (inv_amp / EPSILON_0C),
         np.real(gy * (1j * _DEG * y)),
@@ -780,8 +780,8 @@ def _vjp_2(args, gy):  # surface
 
     g_rl, g_t, g_rr = gy[:, :, 0], gy[:, :, 1], gy[:, :, 2]
 
-    inv_2sr = np.where(sqrt_r > 0.0, -0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), 0.0)
-    inv_2st = np.where(sqrt_t > 0.0, -0.5 / np.where(sqrt_t > 0.0, sqrt_t, 1.0), 0.0)
+    inv_2sr = np.where(sqrt_r > 0.0, -0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), np.nan)
+    inv_2st = np.where(sqrt_t > 0.0, -0.5 / np.where(sqrt_t > 0.0, sqrt_t, 1.0), np.nan)
     g_abs_r = np.real(g_rl * e_rl + g_rr * e_rr) * inv_2sr
     g_abs_t = np.real(g_t * e_t) * inv_2st
 
@@ -920,7 +920,7 @@ def _vjp_14(args, gy):  # corrected_optomechanical_phase_left
     y = (1j * _Z_SCALE) * cl * sqrt_r * e
 
     g_cl = np.real(gy * ((1j * _Z_SCALE) * sqrt_r * e))
-    inv_2sr = np.where(sqrt_r > 0.0, 0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), 0.0)
+    inv_2sr = np.where(sqrt_r > 0.0, 0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), np.nan)
     g_abs_r = np.real(gy * ((1j * _Z_SCALE) * cl * inv_2sr * e))
     g_phase = np.real(gy * (1j * y))
 
@@ -947,7 +947,7 @@ def _vjp_15(args, gy):  # corrected_optomechanical_phase_right
     y = (-1j * _Z_SCALE) * cr_om * sqrt_r * e
 
     g_cr_om = np.real(gy * ((-1j * _Z_SCALE) * sqrt_r * e))
-    inv_2sr = np.where(sqrt_r > 0.0, 0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), 0.0)
+    inv_2sr = np.where(sqrt_r > 0.0, 0.5 / np.where(sqrt_r > 0.0, sqrt_r, 1.0), np.nan)
     g_abs_r = np.real(gy * ((-1j * _Z_SCALE) * cr_om * inv_2sr * e))
     g_phase = np.real(gy * (1j * y))
     g_cr_rf = g_phase * (-2.0 * t_rad * n_r * f_fac)
@@ -1034,7 +1034,7 @@ def _cos_beta_and_derivs_c(alpha_deg, n_l, n_r):
 
 def _inv_2sqrt_c(x, sqrt_x, scale):
     nonzero = x != 0.0
-    return np.where(nonzero, scale / np.where(nonzero, sqrt_x, 1.0), 0.0)
+    return np.where(nonzero, scale / np.where(nonzero, sqrt_x, 1.0), np.nan)
 
 
 def _out_0(args):
