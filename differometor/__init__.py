@@ -11,8 +11,8 @@ def _configure_compiler():
     floating-point noise. Allowed by the Feyer team (#feyer, Sat 21 Nov 20:51).
 
     `XLA_FLAGS` is read when the CPU backend starts, which happens after this import in normal use.
-    The flag is only added for the jaxlib release it was verified with, because XLA aborts the
-    process on unknown flags.
+    Only add CPU flags for explicitly supported jaxlib versions. An unknown flag can abort XLA
+    during backend initialization.
     """
     try:
         from jaxlib import version as _jaxlib_version
@@ -28,7 +28,7 @@ def _configure_compiler():
         "xla_cpu_parallel_codegen_split_count": "1",
     }
     existing = _os.environ.get("XLA_FLAGS", "")
-    if jaxlib_version.startswith("0.9."):
+    if jaxlib_version in ("0.9.0", "0.9.0.1"):
         added = [f"--{name}={value}" for name, value in flags.items() if name not in existing]
         _os.environ["XLA_FLAGS"] = " ".join([existing, *added]).strip()
 
