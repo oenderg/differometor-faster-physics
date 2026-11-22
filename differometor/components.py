@@ -862,6 +862,7 @@ def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
         or getattr(signal, "weak_type", False)
         or not carrier.ndim
         or not signal.ndim
+        or carrier.ndim != signal.ndim
         or not all(isinstance(size, int) for size in (*carrier.shape, *signal.shape))
         or signal.shape[0] < 2 * carrier.shape[0]
     ):
